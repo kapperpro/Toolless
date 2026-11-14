@@ -1,0 +1,36 @@
+[package]
+name = "toolless"
+version = "0.2.0"
+description = "Toolless – kleine, effiziente Werkzeugsammlung für den Desktop (reines Rust, egui)"
+edition = "2021"
+
+[dependencies]
+# Natives GUI
+eframe = "0.29"
+raw-window-handle = "0.6"
+# System-Tray
+tray-icon = "0.19"
+# Persistenz (Clipboard-Manager, Einstellungen)
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# System-Zwischenablage
+arboard = "3"
+# Autostart-Eintrag im Betriebssystem
+auto-launch = "0.5"
+# Ruhezustand blockieren
+keepawake = "0.5"
+# Spotify Web API – blockierender Client, keine async-Runtime nötig
+rspotify = { version = "0.13", default-features = false, features = ["client-ureq", "ureq-rustls-tls"] }
+url = "2"
+open = "5"
+# Sonstiges
+dirs = "5"
+single-instance = "0.3"
+thiserror = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
