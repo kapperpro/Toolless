@@ -1,71 +1,82 @@
-//! SQLite-Zugriff: Schema, Verbindungs-Wrapper und Key/Value-Einstellungen.
+//! Datenspeicher der App: gespeicherte Zwischenablage-Einträge und Einstellungen.
+//!
+//! Alles liegt in einer einzigen JSON-Datei, die verschlüsselt auf die Platte
+//! geschrieben wird (siehe `crate::crypto`). Die Datenmenge ist klein, deshalb
+//! wird die Datei bei jeder Änderung komplett neu geschrieben.
 
-use std::{path::Path, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    crypto,
+    error::{AppError, AppResult},
+    services::clipboard::ClipItem,
+};
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS clipboard_items (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    title      TEXT NOT NULL,
-    category   TEXT NOT NULL DEFAULT '',
-    content    TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_clipboard_category ON clipboard_items(category);
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-";
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Data {
+    pub next_clip_id: i64,
+    /// Neueste zuerst.
+    pub clips: Vec<ClipItem>,
+    pub settings: BTreeMap<String, String>,
+}
 
-/// Thread-sicherer Wrapper um die SQLite-Verbindung (als Tauri-State verwaltet).
-pub struct Db(Mutex<Connection>);
+/// Thread-sicherer Zugriff auf den Datenspeicher.
+pub struct Db {
+    path: PathBuf,
+    data: Mutex<Data>,
+}
 
 impl Db {
     pub fn open(path: &Path) -> AppResult<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(Self(Mutex::new(conn)))
+        let data = if path.exists() {
+            let bytes = crypto::read_file(path)?;
+            serde_json::from_slice(&bytes)
+                .map_err(|e| AppError::other(format!("Datenspeicher ist beschädigt: {e}")))?
+        } else {
+            Data::default()
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            data: Mutex::new(data),
+        })
     }
 
-    /// Führt `f` mit exklusivem Zugriff auf die Verbindung aus.
-    pub fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> AppResult<T> {
-        let conn = self
-            .0
+    /// Liest aus dem Speicher.
+    pub fn read<T>(&self, f: impl FnOnce(&Data) -> T) -> AppResult<T> {
+        let data = self
+            .data
             .lock()
-            .map_err(|_| AppError::other("Datenbank-Lock ist nicht verfügbar"))?;
-        Ok(f(&conn)?)
+            .map_err(|_| AppError::other("Datenspeicher ist nicht verfügbar"))?;
+        Ok(f(&data))
+    }
+
+    /// Ändert den Speicher und schreibt ihn anschließend verschlüsselt auf die Platte.
+    pub fn write<T>(&self, f: impl FnOnce(&mut Data) -> T) -> AppResult<T> {
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| AppError::other("Datenspeicher ist nicht verfügbar"))?;
+        let result = f(&mut data);
+        let json = serde_json::to_vec(&*data)
+            .map_err(|e| AppError::other(format!("Datenspeicher: {e}")))?;
+        crypto::write_file(&self.path, &json)?;
+        Ok(result)
     }
 
     pub fn get_setting(&self, key: &str) -> AppResult<Option<String>> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![key],
-                |r| r.get(0),
-            )
-            .optional()
-        })
+        self.read(|data| data.settings.get(key).cloned())
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> AppResult<()> {
-        self.with(|c| {
-            c.execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )
-            .map(|_| ())
-        })
-    }
-
-    pub fn delete_setting(&self, key: &str) -> AppResult<()> {
-        self.with(|c| {
-            c.execute("DELETE FROM settings WHERE key = ?1", params![key])
-                .map(|_| ())
+        self.write(|data| {
+            data.settings.insert(key.to_owned(), value.to_owned());
         })
     }
 }

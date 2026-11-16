@@ -1,6 +1,6 @@
 [package]
 name = "toolless"
-version = "0.2.0"
+version = "0.8.0"
 description = "Toolless – kleine, effiziente Werkzeugsammlung für den Desktop (reines Rust, egui)"
 edition = "2021"
 
@@ -10,24 +10,46 @@ eframe = "0.29"
 raw-window-handle = "0.6"
 # System-Tray
 tray-icon = "0.19"
-# Persistenz (Clipboard-Manager, Einstellungen)
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Persistenz: JSON, auf der Platte verschlüsselt (siehe src/crypto.rs)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Album-Cover dekodieren
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "webp"] }
+# Auslastung, Prozesse, Datenträger, Temperatursensoren
+sysinfo = "0.32"
+# Systemdialoge „Öffnen“ / „Speichern unter“
+rfd = "0.15"
+# Minecraft-Welten: level.dat ist gzip-komprimiert
+flate2 = "1"
 # System-Zwischenablage
 arboard = "3"
 # Autostart-Eintrag im Betriebssystem
 auto-launch = "0.5"
 # Ruhezustand blockieren
 keepawake = "0.5"
-# Spotify Web API – blockierender Client, keine async-Runtime nötig
-rspotify = { version = "0.13", default-features = false, features = ["client-ureq", "ureq-rustls-tls"] }
-url = "2"
-open = "5"
 # Sonstiges
 dirs = "5"
 single-instance = "0.3"
 thiserror = "2"
+
+# Mediensteuerung über die Windows-Systemschnittstelle (wie Wallpaper Engine):
+# liest Titel/Interpret der laufenden Wiedergabe und steuert sie – ohne Anmeldung.
+[target.'cfg(windows)'.dependencies]
+# NVIDIA-Grafikkarten: Temperatur, Auslastung, Leistungsaufnahme
+nvml-wrapper = "0.10"
+windows = { version = "0.58", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media",
+    "Media_Control",
+    "Storage_Streams",
+    # Lautstärke der Spotify-Audiositzung
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
 
 [profile.release]
 codegen-units = 1

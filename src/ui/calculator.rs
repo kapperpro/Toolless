@@ -1,15 +1,18 @@
-use eframe::egui::{self, Align, Button, Color32, Event, Frame, Key, Layout, Margin, RichText, Ui};
+use crate::i18n::t;
+use eframe::egui::{self, Align, Button, Event, Frame, Key, Layout, Margin, RichText, Stroke, Ui};
 
 use crate::{
     app::Shared,
     services::calc::{evaluate, format_number},
-    theme,
+    theme::{self, Palette},
 };
 
-const KEY_W: f32 = 58.0;
-const KEY_H: f32 = 50.0;
-const GAP: f32 = 8.0;
+const GAP: f32 = 4.0;
+/// Breite der Verlaufsspalte neben dem Tastenfeld.
+const HISTORY_WIDTH: f32 = 250.0;
 const OPERATORS: &str = "+−×÷";
+/// Internes Kommando der Rücktaste (auf der Taste steht „←“).
+const BACKSPACE: &str = "⌫";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -18,36 +21,37 @@ enum Kind {
     Digit,
 }
 
-const ROWS: [[(&str, Kind); 4]; 5] = [
+/// Tastenfeld: (Beschriftung, Kommando, Art).
+const ROWS: [[(&str, &str, Kind); 4]; 5] = [
     [
-        ("AC", Kind::Function),
-        ("(", Kind::Function),
-        (")", Kind::Function),
-        ("÷", Kind::Operator),
+        ("C", "AC", Kind::Function),
+        ("(", "(", Kind::Function),
+        (")", ")", Kind::Function),
+        ("←", BACKSPACE, Kind::Function),
     ],
     [
-        ("7", Kind::Digit),
-        ("8", Kind::Digit),
-        ("9", Kind::Digit),
-        ("×", Kind::Operator),
+        ("7", "7", Kind::Digit),
+        ("8", "8", Kind::Digit),
+        ("9", "9", Kind::Digit),
+        ("÷", "÷", Kind::Operator),
     ],
     [
-        ("4", Kind::Digit),
-        ("5", Kind::Digit),
-        ("6", Kind::Digit),
-        ("−", Kind::Operator),
+        ("4", "4", Kind::Digit),
+        ("5", "5", Kind::Digit),
+        ("6", "6", Kind::Digit),
+        ("×", "×", Kind::Operator),
     ],
     [
-        ("1", Kind::Digit),
-        ("2", Kind::Digit),
-        ("3", Kind::Digit),
-        ("+", Kind::Operator),
+        ("1", "1", Kind::Digit),
+        ("2", "2", Kind::Digit),
+        ("3", "3", Kind::Digit),
+        ("−", "−", Kind::Operator),
     ],
     [
-        ("±", Kind::Digit),
-        ("0", Kind::Digit),
-        (",", Kind::Digit),
-        ("=", Kind::Operator),
+        ("±", "±", Kind::Digit),
+        ("0", "0", Kind::Digit),
+        (",", ",", Kind::Digit),
+        ("+", "+", Kind::Operator),
     ],
 ];
 
@@ -55,6 +59,10 @@ const ROWS: [[(&str, Kind); 4]; 5] = [
 pub struct CalculatorView {
     expression: String,
     error: Option<String>,
+    /// Tastengröße und Verlaufsbreite – werden pro Frame aus dem verfügbaren Platz berechnet.
+    key_w: f32,
+    key_h: f32,
+    history_w: f32,
     /// Nach „=“ ersetzt die nächste Zifferneingabe das Ergebnis.
     just_evaluated: bool,
     history: Vec<(String, String)>,
@@ -163,110 +171,190 @@ impl CalculatorView {
         }
     }
 
-    fn key_button(&mut self, ui: &mut Ui, label: &str, kind: Kind, width: f32) {
-        let fill = match kind {
-            Kind::Function => Color32::from_gray(99),
-            Kind::Operator => Color32::from_rgb(255, 159, 10),
-            Kind::Digit => Color32::from_gray(58),
+    fn key_button(
+        &mut self,
+        ui: &mut Ui,
+        p: &Palette,
+        label: &str,
+        command: &str,
+        kind: Kind,
+        width: f32,
+    ) {
+        let (fill, color) = match kind {
+            Kind::Digit => (p.control_bg, p.text),
+            Kind::Function | Kind::Operator => (p.field_bg, p.text),
         };
-        let button = Button::new(RichText::new(label).size(20.0).color(Color32::WHITE))
+        let (fill, color) = if command == "=" {
+            (p.accent, p.on_accent)
+        } else {
+            (fill, color)
+        };
+        let button = Button::new(RichText::new(label).size(17.0).color(color))
             .fill(fill)
-            .rounding(KEY_H / 2.0);
-        if ui.add_sized([width, KEY_H], button).clicked() {
-            self.press(label);
+            .stroke(Stroke::new(1.0_f32, p.separator.gamma_multiply(0.6)))
+            .rounding(p.radius);
+        if ui.add_sized([width, self.key_h], button).clicked() {
+            self.press(command);
+        }
+    }
+
+    fn keypad(&mut self, ui: &mut Ui, p: &Palette) {
+        let key_w = self.key_w;
+        let pad_width = 4.0 * key_w + 3.0 * GAP;
+        ui.set_width(pad_width);
+        ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+
+        // Anzeige: oben Vorschau/Fehler, darunter der Ausdruck.
+        let preview = match (&self.error, self.just_evaluated) {
+            (Some(error), _) => error.clone(),
+            (None, false) if !self.expression.is_empty() => evaluate(&self.expression)
+                .map(|v| format!("= {}", format_number(v)))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        Frame::none()
+            .fill(p.field_bg)
+            .rounding(p.radius)
+            .inner_margin(Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.set_width(pad_width - 20.0);
+                ui.with_layout(Layout::top_down(Align::Max), |ui| {
+                    let preview_color = if self.error.is_some() {
+                        p.danger
+                    } else {
+                        p.text_secondary
+                    };
+                    ui.label(RichText::new(preview).size(13.0).color(preview_color));
+                    let shown = if self.expression.is_empty() {
+                        "0"
+                    } else {
+                        &self.expression
+                    };
+                    // Lange Ausdrücke: das Ende bleibt sichtbar.
+                    let tail: String = {
+                        let chars: Vec<char> = shown.chars().collect();
+                        let start = chars.len().saturating_sub(15);
+                        chars[start..].iter().collect()
+                    };
+                    ui.label(RichText::new(tail).size(30.0).color(p.text));
+                });
+            });
+        ui.add_space(4.0);
+
+        for row in ROWS {
+            ui.horizontal(|ui| {
+                for (label, command, kind) in row {
+                    self.key_button(ui, p, label, command, kind, key_w);
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            self.key_button(ui, p, "%", "%", Kind::Function, key_w);
+            self.key_button(ui, p, "=", "=", Kind::Operator, 3.0 * key_w + 2.0 * GAP);
+        });
+    }
+
+    fn history_panel(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.set_width(self.history_w);
+        ui.horizontal(|ui| {
+            theme::card_title(ui, t("Verlauf"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(!self.history.is_empty(), Button::new(t("Verlauf löschen")))
+                    .clicked()
+                {
+                    self.history.clear();
+                }
+            });
+        });
+        if self.history.is_empty() {
+            ui.label(theme::secondary(p, t("Noch keine Rechnungen.")));
+            return;
+        }
+
+        let mut reuse = None;
+        let mut remove = None;
+        egui::ScrollArea::vertical()
+            .max_height(300.0)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (index, (expression, result)) in self.history.iter().enumerate() {
+                    let row = theme::clickable_row(ui, p, 44.0, false, |ui| {
+                        ui.with_layout(Layout::top_down(Align::Max), |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.add_space(3.0);
+                            ui.label(theme::secondary(p, expression.clone()).size(12.5));
+                            ui.label(RichText::new(format!("= {result}")).strong());
+                        });
+                    })
+                    .on_hover_text(t(
+                        "Klick übernimmt das Ergebnis · Rechtsklick entfernt den Eintrag",
+                    ));
+                    if row.clicked() {
+                        reuse = Some(result.clone());
+                    }
+                    row.context_menu(|ui| {
+                        if ui.button(t("Ergebnis übernehmen")).clicked() {
+                            reuse = Some(result.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button(t("Eintrag entfernen")).clicked() {
+                            remove = Some(index);
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
+        if let Some(result) = reuse {
+            self.expression = result;
+            self.just_evaluated = true;
+            self.error = None;
+        }
+        if let Some(index) = remove {
+            self.history.remove(index);
         }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, shared: &mut Shared) {
         self.handle_keyboard(ui);
         let p = shared.palette;
-        let pad_width = 4.0 * KEY_W + 3.0 * GAP;
 
-        ui.horizontal_top(|ui| {
-            Frame::none()
-                .fill(Color32::from_rgb(28, 28, 30))
-                .rounding(16.0)
-                .inner_margin(Margin::same(14.0))
-                .show(ui, |ui| {
-                    ui.set_width(pad_width);
-                    ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+        // Tastenfeld und Verlauf teilen sich den Platz: breit nebeneinander, schmal untereinander.
+        // Die Tasten wachsen mit dem Fenster, bleiben aber in einem angenehmen Bereich.
+        const CARD_PADDING: f32 = 30.0;
+        let available = ui.available_size();
+        let side_by_side = available.x >= 620.0;
+        let pad_width = if side_by_side {
+            (available.x - HISTORY_WIDTH - 2.0 * CARD_PADDING - 8.0).clamp(250.0, 520.0)
+        } else {
+            (available.x - CARD_PADDING).clamp(220.0, 520.0)
+        };
+        self.key_w = (pad_width - 3.0 * GAP) / 4.0;
+        let height_for_keys = if available.y.is_finite() {
+            available.y - 150.0
+        } else {
+            320.0
+        };
+        self.key_h = (height_for_keys / 6.0 - GAP).clamp(34.0, 62.0);
+        self.history_w = if side_by_side {
+            HISTORY_WIDTH
+        } else {
+            pad_width
+        };
 
-                    // Anzeige: oben Vorschau/Fehler, darunter der Ausdruck.
-                    let preview = match (&self.error, self.just_evaluated) {
-                        (Some(error), _) => error.clone(),
-                        (None, false) if !self.expression.is_empty() => evaluate(&self.expression)
-                            .map(|v| format!("= {}", format_number(v)))
-                            .unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                    ui.with_layout(Layout::top_down(Align::Max), |ui| {
-                        ui.label(
-                            RichText::new(preview)
-                                .size(13.0)
-                                .color(Color32::from_gray(150)),
-                        );
-                        let shown = if self.expression.is_empty() {
-                            "0"
-                        } else {
-                            &self.expression
-                        };
-                        // Lange Ausdrücke: das Ende bleibt sichtbar.
-                        let tail: String = {
-                            let chars: Vec<char> = shown.chars().collect();
-                            let start = chars.len().saturating_sub(13);
-                            chars[start..].iter().collect()
-                        };
-                        ui.label(RichText::new(tail).size(32.0).color(Color32::WHITE));
-                    });
-                    ui.add_space(4.0);
-
-                    for row in ROWS {
-                        ui.horizontal(|ui| {
-                            for (label, kind) in row {
-                                self.key_button(ui, label, kind, KEY_W);
-                            }
-                        });
-                    }
-                    ui.horizontal(|ui| {
-                        let wide = 2.0 * KEY_W + GAP;
-                        self.key_button(ui, "%", Kind::Function, wide);
-                        // Anzeige „Löschen“, intern das Rücktasten-Kommando.
-                        let button =
-                            Button::new(RichText::new("Löschen").size(16.0).color(Color32::WHITE))
-                                .fill(Color32::from_gray(99))
-                                .rounding(KEY_H / 2.0);
-                        if ui.add_sized([wide, KEY_H], button).clicked() {
-                            self.press("⌫");
-                        }
-                    });
+        if side_by_side {
+            ui.horizontal_top(|ui| {
+                // Karten liegen in einer waagerechten Reihe – ihr Inhalt läuft senkrecht.
+                theme::card(&p).show(ui, |ui| {
+                    ui.vertical(|ui| self.keypad(ui, &p));
                 });
-
-            theme::card(&p).show(ui, |ui| {
-                ui.set_width(230.0);
-                theme::card_title(ui, "Verlauf");
-                if self.history.is_empty() {
-                    ui.label(theme::secondary(&p, "Noch keine Rechnungen."));
-                }
-                let mut reuse = None;
-                egui::ScrollArea::vertical()
-                    .max_height(360.0)
-                    .show(ui, |ui| {
-                        for (expression, result) in &self.history {
-                            ui.label(theme::secondary(&p, expression.clone()));
-                            let entry = Button::new(RichText::new(format!("= {result}")).strong())
-                                .frame(false);
-                            if ui.add(entry).on_hover_text("Ergebnis übernehmen").clicked() {
-                                reuse = Some(result.clone());
-                            }
-                            ui.separator();
-                        }
-                    });
-                if let Some(result) = reuse {
-                    self.expression = result;
-                    self.just_evaluated = true;
-                    self.error = None;
-                }
+                theme::card(&p).show(ui, |ui| {
+                    ui.vertical(|ui| self.history_panel(ui, &p));
+                });
             });
-        });
+        } else {
+            theme::card(&p).show(ui, |ui| self.keypad(ui, &p));
+            theme::card(&p).show(ui, |ui| self.history_panel(ui, &p));
+        }
     }
 }

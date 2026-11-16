@@ -6,17 +6,23 @@
 //! - `services/*` Fachlogik (Spotify, Zwischenablage, Notizen, Starter, …)
 //! - `tray`      System-Tray
 //! - `platform`  Fenster verstecken/anzeigen
-//! - `theme`     Farben und Bausteine im macOS-Stil
-//! - `db`, `error`
+//! - `theme`     Farben und Bausteine im Windows-Stil, anpassbar
+//! - `settings`  Benutzereinstellungen (Design, Verhalten)
+//! - `db`, `crypto` verschlüsselter Datenspeicher
+//! - `error`
 
 // Unter Windows im Release-Build kein zusätzliches Konsolenfenster öffnen.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod crypto;
 mod db;
 mod error;
+mod i18n;
+mod i18n_table;
 mod platform;
 mod services;
+mod settings;
 mod theme;
 mod tray;
 mod ui;
@@ -47,7 +53,6 @@ fn main() -> eframe::Result<()> {
         .with_inner_size([1040.0, 700.0])
         .with_min_inner_size([860.0, 560.0])
         .with_decorations(false)
-        .with_transparent(true)
         .with_visible(visible)
         .with_icon(icon);
     let options = eframe::NativeOptions {
