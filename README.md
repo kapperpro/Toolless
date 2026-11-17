@@ -90,13 +90,6 @@ The measuring interval can be chosen at the top right (2 s, 1 s, 0.5 s, 0.1 s). 
   and "Yesterday". Recording also continues while Toolless runs in the tray.
 - **Disks:** Volumes and the partition layout of the physical disks – read-only.
   Changes are made through the button for the Windows Disk Management.
-- **Energy:** Current power, total energy, CO₂ and costs as well as consumption per program
-  and component. Values are measured where sensors exist: graphics cards via the driver (NVIDIA: NVML,
-  AMD: ADL), the processor via the Windows energy counters if the system offers them. The
-  rest (memory, mainboard, drives, power supply losses) is an estimate. The page shows for each
-  component whether the value is measured or estimated. Inspired by
-  [WattSeal](https://github.com/Daminoup88/WattSeal), but without its code, kernel driver or
-  administrator rights.
 - **Graphics card:** Load comes from the Windows performance counters, temperature from the
   graphics driver (as in the Task Manager); NVIDIA additionally via NVML.
 - **CPU temperature:** Only if Windows provides it – on many systems only with
@@ -170,7 +163,7 @@ are stored unencrypted.
 - **Refresh:** Every tab has a "Refresh" button at the top right (key F5) that reloads the view.
 - **Autostart in dev mode** registers the debug `exe`. Use the release build for everyday use.
 - **Other systems:** Media control, app icons and encryption exist only on Windows;
-  on Linux the app runs without a tray icon.
+- Linux and Macoes are curently not supportet
 
 ## License
 
