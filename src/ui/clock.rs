@@ -1,78 +1,58 @@
-//! Uhr: Wecker, Countdown, Stoppuhr sowie „AFK“ (schwarzer Bildschirm) und die große
-//! Uhr über alle Bildschirme. Beide halten den Rechner wach.
+//! Uhr: Wecker, mehrere Countdowns und Stoppuhren sowie die Vollbildmodi „AFK“, „Große Uhr“
+//! und Spotify (siehe `blackout`). Wecker und Countdowns klingeln auch im Hintergrund.
 
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, RichText, Ui};
+use eframe::egui::{self, Align, Align2, Layout, RichText, Ui};
 
 use crate::{
     app::Shared,
     i18n::{t, td},
-    platform::{self, LocalTime},
-    services::{
-        clock::{self, Alarm, ClockHandle, Moment},
-        power::PowerState,
-    },
-    settings::SavedAlarm,
+    platform,
+    services::clock::{self, Alarm, ClockHandle, Countdown, Moment},
+    settings::{SavedAlarm, SavedCountdown},
     theme::{self, Palette},
+    ui::blackout::{self, format_date, Mode},
 };
 
-/// Fenstertitel der Vollbildfläche – darüber findet Windows das Fenster wieder.
-const BLACKOUT_TITLE: &str = "Toolless – Bildschirm aus";
-/// So lange nach dem Start werden Eingaben ignoriert (der Klick, der gestartet hat).
-const BLACKOUT_GRACE: Duration = Duration::from_millis(700);
+/// Eine Stoppuhr; läuft nur, solange die App läuft.
+struct Stopwatch {
+    id: u64,
+    label: String,
+    since: Option<Instant>,
+    total: Duration,
+    laps: Vec<Duration>,
+}
 
-const WEEKDAYS: [&str; 7] = [
-    "Sonntag",
-    "Montag",
-    "Dienstag",
-    "Mittwoch",
-    "Donnerstag",
-    "Freitag",
-    "Samstag",
-];
-const MONTHS: [&str; 12] = [
-    "Januar",
-    "Februar",
-    "März",
-    "April",
-    "Mai",
-    "Juni",
-    "Juli",
-    "August",
-    "September",
-    "Oktober",
-    "November",
-    "Dezember",
-];
+impl Stopwatch {
+    fn elapsed(&self) -> Duration {
+        self.total + self.since.map_or(Duration::ZERO, |since| since.elapsed())
+    }
+}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Blackout {
-    /// Nur schwarz.
-    Afk,
-    /// Schwarz mit großer Uhr auf jedem Bildschirm.
-    Clock,
+/// Eingabefenster zum Hinzufügen.
+enum Dialog {
+    Alarm {
+        hour: u8,
+        minute: u8,
+        label: String,
+        repeat: bool,
+    },
+    Countdown {
+        hours: u32,
+        minutes: u32,
+        seconds: u32,
+        label: String,
+    },
 }
 
 pub struct ClockView {
     handle: ClockHandle,
-    // Neuer Wecker.
-    new_hour: u8,
-    new_minute: u8,
-    new_label: String,
-    new_repeat: bool,
-    // Countdown-Eingabe.
-    hours: u32,
-    minutes: u32,
-    seconds: u32,
-    // Stoppuhr.
-    stopwatch_since: Option<Instant>,
-    stopwatch_total: Duration,
-    laps: Vec<Duration>,
-    // Schwarzer Bildschirm.
-    blackout: Option<(Blackout, Instant)>,
-    keep_awake: PowerState,
-    screens: Vec<[i32; 4]>,
+    dialog: Option<Dialog>,
+    stopwatches: Vec<Stopwatch>,
+    next_stopwatch: u64,
+    /// Wartet auf einen Tastendruck für die eigene Beenden-Taste.
+    capturing_key: bool,
     /// Klingelte es im letzten Bild schon? (um das Fenster nur einmal hervorzuholen)
     was_ringing: bool,
 }
@@ -80,16 +60,10 @@ pub struct ClockView {
 fn moment() -> Moment {
     let now = platform::local_time();
     Moment {
-        day: now.month as u32 * 32 + now.day as u32,
+        day: now.year as u32 * 512 + now.month as u32 * 32 + now.day as u32,
         hour: now.hour,
         minute: now.minute,
     }
-}
-
-fn format_date(time: &LocalTime) -> String {
-    let weekday = t(WEEKDAYS[time.weekday as usize % 7]);
-    let month = t(MONTHS[(time.month as usize).clamp(1, 12) - 1]);
-    format!("{weekday}, {}. {month} {}", time.day, time.year)
 }
 
 fn format_span(duration: Duration, tenths: bool) -> String {
@@ -107,18 +81,80 @@ fn format_span(duration: Duration, tenths: bool) -> String {
     }
 }
 
-fn section(ui: &mut Ui, p: &Palette, title: &'static str, add_contents: impl FnOnce(&mut Ui)) {
+/// Karte mit Titel und einem „+“-Knopf rechts oben. Liefert `true`, wenn er gedrückt wurde.
+fn section(
+    ui: &mut Ui,
+    p: &Palette,
+    title: &'static str,
+    add_button: Option<&'static str>,
+    add_contents: impl FnOnce(&mut Ui),
+) -> bool {
+    let mut add = false;
     theme::card(p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        theme::card_title(ui, t(title));
+        ui.horizontal(|ui| {
+            theme::card_title(ui, t(title));
+            if let Some(label) = add_button {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(t(label)).clicked() {
+                        add = true;
+                    }
+                });
+            }
+        });
         ui.add_space(2.0);
         add_contents(ui);
     });
+    add
+}
+
+/// Auswahl der Bildschirme für die Vollbildmodi (leer = alle).
+pub fn screen_picker(ui: &mut Ui, shared: &mut Shared) {
+    let screens = platform::screens();
+    let mut chosen = shared.settings.afk_screens.clone();
+    chosen.retain(|index| *index < screens.len().max(1));
+    let text = if chosen.is_empty() {
+        t("Alle Bildschirme").to_owned()
+    } else {
+        let numbers: Vec<String> = chosen.iter().map(|index| (index + 1).to_string()).collect();
+        td(format!("Bildschirm {}", numbers.join(", ")))
+    };
+    let mut changed = false;
+    egui::ComboBox::from_id_salt("blackout_screens")
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            let mut all = chosen.is_empty();
+            if ui.checkbox(&mut all, t("Alle Bildschirme")).changed() {
+                chosen = if all { Vec::new() } else { vec![0] };
+                changed = true;
+            }
+            for (index, [_, _, width, height]) in screens.iter().enumerate() {
+                let mut on = chosen.contains(&index);
+                let label = td(format!("Bildschirm {} · {width}×{height}", index + 1));
+                if ui.checkbox(&mut on, label).changed() {
+                    if on {
+                        chosen.push(index);
+                        chosen.sort_unstable();
+                    } else {
+                        chosen.retain(|other| *other != index);
+                    }
+                    changed = true;
+                }
+            }
+        });
+    if changed {
+        shared.settings.afk_screens = chosen;
+        shared.save_settings();
+    }
 }
 
 impl ClockView {
-    pub fn new(saved: &[SavedAlarm], countdown_secs: u32, ctx: egui::Context) -> Self {
-        let alarms = saved
+    pub fn new(
+        saved_alarms: &[SavedAlarm],
+        saved_countdowns: &[SavedCountdown],
+        ctx: egui::Context,
+    ) -> Self {
+        let alarms = saved_alarms
             .iter()
             .map(|alarm| Alarm {
                 id: alarm.id,
@@ -129,169 +165,73 @@ impl ClockView {
                 repeat: alarm.repeat,
             })
             .collect();
+        let countdowns = saved_countdowns
+            .iter()
+            .map(|countdown| Countdown {
+                id: countdown.id,
+                label: countdown.label.clone(),
+                secs: countdown.secs,
+                end: None,
+            })
+            .collect();
         Self {
-            handle: ClockHandle::spawn(alarms, moment, platform::beep, move || {
+            handle: ClockHandle::spawn(alarms, countdowns, moment, platform::beep, move || {
                 ctx.request_repaint();
             }),
-            new_hour: 7,
-            new_minute: 0,
-            new_label: String::new(),
-            new_repeat: true,
-            hours: countdown_secs / 3600,
-            minutes: countdown_secs % 3600 / 60,
-            seconds: countdown_secs % 60,
-            stopwatch_since: None,
-            stopwatch_total: Duration::ZERO,
-            laps: Vec::new(),
-            blackout: None,
-            keep_awake: PowerState::default(),
-            screens: Vec::new(),
+            dialog: None,
+            stopwatches: Vec::new(),
+            next_stopwatch: 1,
+            capturing_key: false,
             was_ringing: false,
         }
     }
 
-    /// Schreibt die Wecker in die Einstellungen.
-    fn persist_alarms(&self, shared: &mut Shared) {
-        shared.settings.alarms = self.handle.read(|state| {
-            state
-                .alarms
-                .iter()
-                .map(|alarm| SavedAlarm {
-                    id: alarm.id,
-                    hour: alarm.hour,
-                    minute: alarm.minute,
-                    label: alarm.label.clone(),
-                    enabled: alarm.enabled,
-                    repeat: alarm.repeat,
-                })
-                .collect()
+    /// Schreibt Wecker und Countdowns in die Einstellungen.
+    fn persist(&self, shared: &mut Shared) {
+        let (alarms, countdowns) = self.handle.read(|state| {
+            (
+                state
+                    .alarms
+                    .iter()
+                    .map(|alarm| SavedAlarm {
+                        id: alarm.id,
+                        hour: alarm.hour,
+                        minute: alarm.minute,
+                        label: alarm.label.clone(),
+                        enabled: alarm.enabled,
+                        repeat: alarm.repeat,
+                    })
+                    .collect(),
+                state
+                    .countdowns
+                    .iter()
+                    .map(|countdown| SavedCountdown {
+                        id: countdown.id,
+                        label: countdown.label.clone(),
+                        secs: countdown.secs,
+                    })
+                    .collect(),
+            )
         });
+        shared.settings.alarms = alarms;
+        shared.settings.countdowns = countdowns;
         shared.save_settings();
     }
 
-    /// Läuft in jedem Bild, auch wenn ein anderes Werkzeug offen ist: zeichnet die
-    /// Vollbildfläche und meldet mit `true`, dass es gerade zu klingeln begonnen hat.
-    pub fn background(&mut self, ctx: &egui::Context, shared: &mut Shared) -> bool {
+    /// Läuft in jedem Bild, auch wenn ein anderes Werkzeug offen ist; meldet mit `true`,
+    /// dass es gerade zu klingeln begonnen hat.
+    pub fn background(&mut self, shared: &mut Shared) -> bool {
         let (ringing, dirty) = self.handle.update(|state| {
             let dirty = state.dirty;
             state.dirty = false;
             (state.ringing.is_some(), dirty)
         });
         if dirty {
-            self.persist_alarms(shared);
+            self.persist(shared);
         }
         let started = ringing && !self.was_ringing;
         self.was_ringing = ringing;
-        if started {
-            // Wer geweckt wird, soll nicht auf eine schwarze Fläche schauen.
-            self.stop_blackout();
-        }
-        self.show_blackout(ctx, shared.settings.blackout_any_key);
         started
-    }
-
-    fn start_blackout(&mut self, mode: Blackout, shared: &mut Shared) {
-        self.screens = platform::screens();
-        self.blackout = Some((mode, Instant::now()));
-        if let Err(err) = self.keep_awake.set(true) {
-            shared.notify(err);
-        }
-    }
-
-    fn stop_blackout(&mut self) {
-        if self.blackout.take().is_some() {
-            let _ = self.keep_awake.set(false);
-        }
-    }
-
-    fn show_blackout(&mut self, ctx: &egui::Context, any_key: bool) {
-        let Some((mode, since)) = self.blackout else {
-            return;
-        };
-        let age = since.elapsed();
-        let origin = platform::virtual_screen();
-        let screens = self.screens.clone();
-        let mut close = false;
-        let builder = egui::ViewportBuilder::default()
-            .with_title(BLACKOUT_TITLE)
-            .with_decorations(false)
-            .with_always_on_top()
-            .with_taskbar(false)
-            .with_inner_size([640.0, 360.0]);
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("toolless-blackout"),
-            builder,
-            |ctx, _class| {
-                // Über alle Bildschirme legen; anfangs zusätzlich den Fokus holen, damit
-                // die Tasten hier ankommen.
-                platform::cover_all_screens(BLACKOUT_TITLE, age < Duration::from_secs(2));
-                ctx.set_cursor_icon(egui::CursorIcon::None);
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(Color32::BLACK))
-                    .show(ctx, |ui| {
-                        if mode != Blackout::Clock {
-                            return;
-                        }
-                        let now = platform::local_time();
-                        let time = format!("{:02}:{:02}:{:02}", now.hour, now.minute, now.second);
-                        let date = format_date(&now);
-                        let scale = ctx.pixels_per_point();
-                        let area = ui.max_rect();
-                        // Je Bildschirm eine Uhr; ohne Bildschirmliste eine in der Mitte.
-                        let mut centers: Vec<(egui::Pos2, f32)> = screens
-                            .iter()
-                            .map(|[x, y, width, height]| {
-                                let center = egui::pos2(
-                                    ((x - origin[0]) as f32 + *width as f32 / 2.0) / scale,
-                                    ((y - origin[1]) as f32 + *height as f32 / 2.0) / scale,
-                                );
-                                (center, *height as f32 / scale)
-                            })
-                            .collect();
-                        if centers.is_empty() {
-                            centers.push((area.center(), area.height()));
-                        }
-                        for (center, height) in centers {
-                            let size = (height * 0.2).clamp(24.0, 400.0);
-                            ui.painter().text(
-                                center,
-                                Align2::CENTER_CENTER,
-                                &time,
-                                FontId::proportional(size),
-                                Color32::from_gray(235),
-                            );
-                            ui.painter().text(
-                                center + egui::vec2(0.0, size * 0.75),
-                                Align2::CENTER_CENTER,
-                                &date,
-                                FontId::proportional(size * 0.16),
-                                Color32::from_gray(150),
-                            );
-                        }
-                        ctx.request_repaint_after(Duration::from_millis(250));
-                    });
-
-                if age > BLACKOUT_GRACE {
-                    close = ctx.input(|input| {
-                        let exit_key = input.key_pressed(egui::Key::F11)
-                            || input.key_pressed(egui::Key::Escape);
-                        let anything = input.events.iter().any(|event| {
-                            matches!(
-                                event,
-                                egui::Event::Key { pressed: true, .. }
-                                    | egui::Event::PointerButton { pressed: true, .. }
-                            )
-                        });
-                        exit_key || (any_key && anything) || input.viewport().close_requested()
-                    });
-                } else {
-                    ctx.request_repaint();
-                }
-            },
-        );
-        if close {
-            self.stop_blackout();
-        }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, shared: &mut Shared) {
@@ -303,11 +243,7 @@ impl ClockView {
             theme::card(&p).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("⏰  {}", td(what)))
-                            .size(18.0)
-                            .color(p.accent),
-                    );
+                    ui.label(RichText::new(td(what)).size(18.0).color(p.accent));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if theme::primary_button(ui, &p, t("Stopp"), true).clicked() {
                             self.handle.update(|state| state.ringing = None);
@@ -317,72 +253,169 @@ impl ClockView {
             });
         }
 
-        // ── Uhrzeit und Vollbild ──
+        self.time_card(ui, shared, &now);
+
+        let (mut add_alarm, mut add_countdown, mut add_stopwatch) = (false, false, false);
+        ui.columns(2, |columns| {
+            add_alarm = self.alarms(&mut columns[0], &p, shared);
+            add_countdown = self.countdowns(&mut columns[1], &p);
+            add_stopwatch = self.stopwatches(&mut columns[1], &p);
+        });
+        if add_alarm {
+            self.dialog = Some(Dialog::Alarm {
+                hour: 7,
+                minute: 0,
+                label: String::new(),
+                repeat: true,
+            });
+        }
+        if add_countdown {
+            self.dialog = Some(Dialog::Countdown {
+                hours: 0,
+                minutes: 5,
+                seconds: 0,
+                label: String::new(),
+            });
+        }
+        if add_stopwatch {
+            let id = self.next_stopwatch;
+            self.next_stopwatch += 1;
+            self.stopwatches.push(Stopwatch {
+                id,
+                label: String::new(),
+                since: Some(Instant::now()),
+                total: Duration::ZERO,
+                laps: Vec::new(),
+            });
+        }
+        self.dialogs(ui.ctx(), shared);
+
+        // Sekundenanzeige und Stoppuhren laufen weiter.
+        let running = self.stopwatches.iter().any(|watch| watch.since.is_some());
+        let pace = if running { 60 } else { 250 };
+        ui.ctx().request_repaint_after(Duration::from_millis(pace));
+    }
+
+    /// Uhrzeit mit den Vollbild-Knöpfen und den Beenden-Optionen.
+    fn time_card(&mut self, ui: &mut Ui, shared: &mut Shared, now: &platform::LocalTime) {
+        let p = shared.palette;
         theme::card(&p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| {
                 let time = format!("{:02}:{:02}:{:02}", now.hour, now.minute, now.second);
-                ui.label(RichText::new(time).size(64.0));
-                ui.label(theme::secondary(&p, format_date(&now)).size(15.0));
+                ui.label(RichText::new(time).size(if p.compact { 64.0 } else { 96.0 }));
+                ui.label(theme::secondary(&p, format_date(now)).size(19.0));
             });
             ui.add_space(8.0);
-            let mut start: Option<Blackout> = None;
-            ui.horizontal(|ui| {
-                if ui
-                    .button(t("AFK – Bildschirme schwarz"))
-                    .on_hover_text(t(
-                        "Alle Bildschirme im Vollbild schwarz. Der Rechner bleibt wach.",
-                    ))
-                    .clicked()
-                {
-                    start = Some(Blackout::Afk);
-                }
-                if ui
-                    .button(t("Große Uhr"))
-                    .on_hover_text(t("Wie AFK, aber mit Uhr auf jedem Bildschirm."))
-                    .clicked()
-                {
-                    start = Some(Blackout::Clock);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let mut any_key = shared.settings.blackout_any_key;
-                    if ui
-                        .checkbox(&mut any_key, t("Jede Taste oder Mausklick beendet"))
-                        .changed()
-                    {
-                        shared.settings.blackout_any_key = any_key;
-                        shared.save_settings();
+            ui.horizontal_wrapped(|ui| {
+                for (mode, label, hint) in [
+                    (
+                        Mode::Afk,
+                        "AFK – Bildschirme schwarz",
+                        "Die gewählten Bildschirme im Vollbild schwarz. Der Rechner bleibt wach.",
+                    ),
+                    (
+                        Mode::Clock,
+                        "Große Uhr",
+                        "Wie AFK, aber mit Uhr auf jedem gewählten Bildschirm.",
+                    ),
+                    (
+                        Mode::Spotify,
+                        "Spotify-Vollbild",
+                        "Zeigt die aktuelle Wiedergabe im Vollbild. Der Rechner bleibt wach.",
+                    ),
+                ] {
+                    if ui.button(t(label)).on_hover_text(t(hint)).clicked() {
+                        shared.blackout_request = Some(mode);
                     }
-                });
+                }
+                ui.label(theme::secondary(&p, t("Bildschirme:")).size(12.5));
+                screen_picker(ui, shared);
             });
-            ui.label(theme::secondary(&p, t("Beenden mit F11 oder Esc.")).size(12.0));
-            if let Some(mode) = start {
-                self.start_blackout(mode, shared);
-            }
+            ui.add_space(2.0);
+            self.exit_options(ui, shared);
         });
-
-        ui.columns(2, |columns| {
-            self.alarms(&mut columns[0], &p, shared);
-            self.countdown(&mut columns[1], &p, shared);
-            self.stopwatch(&mut columns[1], &p);
-        });
-
-        // Sekundenanzeige und Stoppuhr laufen weiter.
-        let pace = if self.stopwatch_since.is_some() {
-            60
-        } else {
-            250
-        };
-        ui.ctx().request_repaint_after(Duration::from_millis(pace));
     }
 
-    fn alarms(&mut self, ui: &mut Ui, p: &Palette, shared: &mut Shared) {
+    /// Beenden-Tasten für die Vollbildmodi.
+    fn exit_options(&mut self, ui: &mut Ui, shared: &mut Shared) {
+        let p = shared.palette;
         let mut changed = false;
-        section(ui, p, t("Wecker"), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::secondary(&p, t("Beenden mit:")).size(12.5));
+            changed |= ui
+                .checkbox(&mut shared.settings.afk_exit_f11, "F11")
+                .changed();
+            changed |= ui
+                .checkbox(&mut shared.settings.afk_exit_esc, "Esc")
+                .changed();
+            changed |= ui
+                .checkbox(&mut shared.settings.blackout_any_key, t("jede Taste"))
+                .changed();
+
+            // Eigene Taste: auf Knopfdruck die nächste Taste übernehmen.
+            let current = egui::Key::from_name(&shared.settings.afk_custom_key);
+            let label = if self.capturing_key {
+                t("Taste drücken …").to_owned()
+            } else {
+                match current {
+                    Some(key) => td(format!("Eigene Taste: {}", key.name())),
+                    None => t("Eigene Taste festlegen").to_owned(),
+                }
+            };
+            if ui.button(label).clicked() {
+                self.capturing_key = !self.capturing_key;
+            }
+            if current.is_some()
+                && ui
+                    .small_button("×")
+                    .on_hover_text(t("Eigene Taste entfernen"))
+                    .clicked()
+            {
+                shared.settings.afk_custom_key.clear();
+                changed = true;
+            }
+        });
+        if self.capturing_key {
+            let pressed = ui.ctx().input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::Key {
+                        key, pressed: true, ..
+                    } => Some(*key),
+                    _ => None,
+                })
+            });
+            if let Some(key) = pressed {
+                self.capturing_key = false;
+                if key != egui::Key::Escape {
+                    if blackout::virtual_key(key).is_some() {
+                        shared.settings.afk_custom_key = key.name().to_owned();
+                        changed = true;
+                    } else {
+                        shared.notify(t("Diese Taste wird nicht unterstützt."));
+                    }
+                }
+            }
+        }
+        ui.label(
+            theme::secondary(
+                &p,
+                t("Als Notausgang beendet Esc, 20 Sekunden lang gehalten, die Vollbildmodi immer."),
+            )
+            .size(12.0),
+        );
+        if changed {
+            shared.save_settings();
+        }
+    }
+
+    fn alarms(&mut self, ui: &mut Ui, p: &Palette, shared: &mut Shared) -> bool {
+        let mut changed = false;
+        let add = section(ui, p, "Wecker", Some("+ Wecker"), |ui| {
             let mut alarms: Vec<Alarm> = self.handle.read(|state| state.alarms.clone());
             let mut remove: Option<u64> = None;
             if alarms.is_empty() {
-                ui.label(theme::secondary(p, t("Noch kein Wecker eingerichtet.")).size(12.5));
+                ui.label(theme::secondary(p, t("Noch kein Wecker eingerichtet.")).size(14.5));
             }
             for alarm in &mut alarms {
                 ui.horizontal(|ui| {
@@ -395,7 +428,7 @@ impl ClockView {
                     } else {
                         p.text_secondary
                     };
-                    ui.label(RichText::new(time).size(20.0).color(color));
+                    ui.label(RichText::new(time).size(34.0).color(color));
                     let kind = if alarm.repeat {
                         t("täglich")
                     } else {
@@ -406,10 +439,10 @@ impl ClockView {
                     } else {
                         format!("{} · {kind}", alarm.label)
                     };
-                    ui.label(theme::secondary(p, details).size(12.5));
+                    ui.label(theme::secondary(p, details).size(14.5));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .small_button("✕")
+                            .small_button("×")
                             .on_hover_text(t("Wecker löschen"))
                             .clicked()
                         {
@@ -422,159 +455,308 @@ impl ClockView {
                 alarms.retain(|alarm| alarm.id != id);
                 changed = true;
             }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut self.new_hour)
-                        .range(0..=23)
-                        .suffix(" h"),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut self.new_minute)
-                        .range(0..=59)
-                        .suffix(" min"),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_label)
-                        .hint_text(t("Bezeichnung"))
-                        .desired_width(130.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.new_repeat, t("Täglich wiederholen"));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button(t("Wecker hinzufügen")).clicked() {
-                        let id = alarms.iter().map(|alarm| alarm.id).max().unwrap_or(0) + 1;
-                        alarms.push(Alarm {
-                            id,
-                            hour: self.new_hour,
-                            minute: self.new_minute,
-                            label: self.new_label.trim().to_owned(),
-                            enabled: true,
-                            repeat: self.new_repeat,
-                        });
-                        alarms.sort_by_key(|alarm| (alarm.hour, alarm.minute));
-                        self.new_label.clear();
-                        changed = true;
-                    }
-                });
-            });
             if changed {
                 self.handle.update(|state| state.alarms = alarms);
             }
         });
         if changed {
-            self.persist_alarms(shared);
+            self.persist(shared);
         }
+        add
     }
 
-    fn countdown(&mut self, ui: &mut Ui, p: &Palette, shared: &mut Shared) {
-        section(ui, p, t("Countdown"), |ui| {
-            let end = self.handle.read(|state| state.countdown_end);
-            match end {
-                Some(end) => {
-                    let left = Duration::from_secs(end.saturating_sub(clock::unix_now()));
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new(format_span(left, false))
-                                .size(36.0)
-                                .color(p.accent),
-                        );
-                    });
-                    if ui.button(t("Abbrechen")).clicked() {
-                        self.handle.update(|state| state.countdown_end = None);
+    /// Liste der Countdowns. Liefert `true`, wenn „+“ gedrückt wurde.
+    fn countdowns(&mut self, ui: &mut Ui, p: &Palette) -> bool {
+        let mut removed: Option<u64> = None;
+        let add = section(ui, p, "Countdowns", Some("+ Countdown"), |ui| {
+            let list: Vec<Countdown> = self.handle.read(|state| state.countdowns.clone());
+            if list.is_empty() {
+                ui.label(theme::secondary(p, t("Noch kein Countdown eingerichtet.")).size(14.5));
+            }
+            let now = clock::unix_now();
+            for countdown in &list {
+                ui.horizontal(|ui| {
+                    let (shown, running) = match countdown.end {
+                        Some(end) => (end.saturating_sub(now) as u32, true),
+                        None => (countdown.secs, false),
+                    };
+                    let color = if running { p.accent } else { p.text };
+                    ui.label(
+                        RichText::new(format_span(Duration::from_secs(shown as u64), false))
+                            .size(34.0)
+                            .color(color),
+                    );
+                    if !countdown.label.trim().is_empty() {
+                        ui.label(theme::secondary(p, countdown.label.trim()).size(14.5));
                     }
-                }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut self.hours)
-                                .range(0..=99)
-                                .suffix(" h"),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut self.minutes)
-                                .range(0..=59)
-                                .suffix(" min"),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut self.seconds)
-                                .range(0..=59)
-                                .suffix(" s"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        for (label, minutes) in
-                            [("1 min", 1), ("5 min", 5), ("15 min", 15), ("30 min", 30)]
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text(t("Countdown löschen"))
+                            .clicked()
                         {
-                            if ui.small_button(label).clicked() {
-                                (self.hours, self.minutes, self.seconds) = (0, minutes, 0);
+                            removed = Some(countdown.id);
+                        }
+                        let label = if running { t("Stopp") } else { t("Start") };
+                        if ui.button(label).clicked() {
+                            let id = countdown.id;
+                            self.handle.update(|state| {
+                                if let Some(entry) =
+                                    state.countdowns.iter_mut().find(|entry| entry.id == id)
+                                {
+                                    entry.end = if running {
+                                        None
+                                    } else {
+                                        Some(clock::unix_now() + entry.secs as u64)
+                                    };
+                                }
+                            });
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(id) = removed {
+            self.handle
+                .update(|state| state.countdowns.retain(|entry| entry.id != id));
+            // Gespeichert wird beim nächsten Hinzufügen bzw. über `persist` im Hintergrund.
+            self.countdowns_dirty();
+        }
+        add
+    }
+
+    /// Merkt vor, dass die Countdown-Liste gespeichert werden muss.
+    fn countdowns_dirty(&self) {
+        self.handle.update(|state| state.dirty = true);
+    }
+
+    /// Liste der Stoppuhren. Liefert `true`, wenn „+“ gedrückt wurde.
+    fn stopwatches(&mut self, ui: &mut Ui, p: &Palette) -> bool {
+        let mut removed: Option<u64> = None;
+        let add = section(ui, p, "Stoppuhren", Some("+ Stoppuhr"), |ui| {
+            if self.stopwatches.is_empty() {
+                ui.label(theme::secondary(p, t("Noch keine Stoppuhr.")).size(14.5));
+            }
+            let count = self.stopwatches.len();
+            for (index, watch) in self.stopwatches.iter_mut().enumerate() {
+                let running = watch.since.is_some();
+                let elapsed = watch.elapsed();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format_span(elapsed, true)).size(34.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut watch.label)
+                            .hint_text(t("Name"))
+                            .desired_width(90.0),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text(t("Stoppuhr löschen"))
+                            .clicked()
+                        {
+                            removed = Some(watch.id);
+                        }
+                        let can_reset = !running && elapsed > Duration::ZERO;
+                        if ui
+                            .add_enabled(can_reset, egui::Button::new(t("Zurücksetzen")))
+                            .clicked()
+                        {
+                            watch.total = Duration::ZERO;
+                            watch.laps.clear();
+                        }
+                        if ui
+                            .add_enabled(running, egui::Button::new(t("Runde")))
+                            .clicked()
+                        {
+                            watch.laps.push(elapsed);
+                        }
+                        let label = if running { t("Anhalten") } else { t("Starten") };
+                        if theme::primary_button(ui, p, label, true).clicked() {
+                            match watch.since.take() {
+                                Some(since) => watch.total += since.elapsed(),
+                                None => watch.since = Some(Instant::now()),
                             }
                         }
                     });
-                    let total = self.hours * 3600 + self.minutes * 60 + self.seconds;
-                    if theme::primary_button(ui, p, t("Starten"), total > 0).clicked() {
-                        let end = clock::unix_now() + total as u64;
-                        self.handle.update(|state| state.countdown_end = Some(end));
-                        shared.settings.countdown_secs = total;
-                        shared.save_settings();
+                });
+                // Die letzten Runden.
+                let mut previous = Duration::ZERO;
+                let skip = watch.laps.len().saturating_sub(4);
+                for (number, lap) in watch.laps.iter().enumerate() {
+                    let split = lap.saturating_sub(previous);
+                    previous = *lap;
+                    if number < skip {
+                        continue;
                     }
+                    ui.label(
+                        theme::secondary(
+                            p,
+                            format!(
+                                "{}. {}  (+{})",
+                                number + 1,
+                                format_span(*lap, true),
+                                format_span(split, true)
+                            ),
+                        )
+                        .size(14.5),
+                    );
+                }
+                if index + 1 < count {
+                    ui.separator();
                 }
             }
         });
+        if let Some(id) = removed {
+            self.stopwatches.retain(|watch| watch.id != id);
+        }
+        add
     }
 
-    fn stopwatch(&mut self, ui: &mut Ui, p: &Palette) {
-        section(ui, p, t("Stoppuhr"), |ui| {
-            let running = self.stopwatch_since.is_some();
-            let elapsed = self.stopwatch_total
-                + self
-                    .stopwatch_since
-                    .map_or(Duration::ZERO, |since| since.elapsed());
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new(format_span(elapsed, true)).size(36.0));
+    /// Eingabefenster für neue Wecker und Countdowns.
+    fn dialogs(&mut self, ctx: &egui::Context, shared: &mut Shared) {
+        let p = shared.palette;
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        let title = match dialog {
+            Dialog::Alarm { .. } => t("Neuer Wecker"),
+            Dialog::Countdown { .. } => t("Neuer Countdown"),
+        };
+        // `Some(true)` = hinzufügen und starten, `Some(false)` = nur hinzufügen.
+        let mut confirmed: Option<bool> = None;
+        let mut cancel = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| match dialog {
+                Dialog::Alarm {
+                    hour,
+                    minute,
+                    label,
+                    repeat,
+                } => {
+                    ui.horizontal(|ui| {
+                        ui.label(t("Uhrzeit"));
+                        ui.add(egui::DragValue::new(hour).range(0..=23).suffix(" h"));
+                        ui.add(egui::DragValue::new(minute).range(0..=59).suffix(" min"));
+                    });
+                    ui.add(
+                        egui::TextEdit::singleline(label)
+                            .hint_text(t("Bezeichnung"))
+                            .desired_width(240.0),
+                    );
+                    ui.checkbox(repeat, t("Täglich wiederholen"));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, &p, t("Hinzufügen"), true).clicked() {
+                            confirmed = Some(false);
+                        }
+                        if ui.button(t("Abbrechen")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+                Dialog::Countdown {
+                    hours,
+                    minutes,
+                    seconds,
+                    label,
+                } => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(hours).range(0..=99).suffix(" h"));
+                        ui.add(egui::DragValue::new(minutes).range(0..=59).suffix(" min"));
+                        ui.add(egui::DragValue::new(seconds).range(0..=59).suffix(" s"));
+                    });
+                    ui.horizontal(|ui| {
+                        for (name, preset) in
+                            [("1 min", 1), ("5 min", 5), ("15 min", 15), ("30 min", 30)]
+                        {
+                            if ui.small_button(name).clicked() {
+                                (*hours, *minutes, *seconds) = (0, preset, 0);
+                            }
+                        }
+                    });
+                    ui.add(
+                        egui::TextEdit::singleline(label)
+                            .hint_text(t("Bezeichnung"))
+                            .desired_width(240.0),
+                    );
+                    ui.add_space(4.0);
+                    let total = *hours * 3600 + *minutes * 60 + *seconds;
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, &p, t("Hinzufügen und starten"), total > 0)
+                            .clicked()
+                        {
+                            confirmed = Some(true);
+                        }
+                        if ui
+                            .add_enabled(total > 0, egui::Button::new(t("Hinzufügen")))
+                            .clicked()
+                        {
+                            confirmed = Some(false);
+                        }
+                        if ui.button(t("Abbrechen")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
             });
-            ui.horizontal(|ui| {
-                let label = if running { t("Anhalten") } else { t("Starten") };
-                if theme::primary_button(ui, p, label, true).clicked() {
-                    match self.stopwatch_since.take() {
-                        Some(since) => self.stopwatch_total += since.elapsed(),
-                        None => self.stopwatch_since = Some(Instant::now()),
-                    }
-                }
-                if ui
-                    .add_enabled(running, egui::Button::new(t("Runde")))
-                    .clicked()
-                {
-                    self.laps.push(elapsed);
-                }
-                let can_reset = !running && elapsed > Duration::ZERO;
-                if ui
-                    .add_enabled(can_reset, egui::Button::new(t("Zurücksetzen")))
-                    .clicked()
-                {
-                    self.stopwatch_total = Duration::ZERO;
-                    self.laps.clear();
-                }
-            });
-            let mut previous = Duration::ZERO;
-            for (index, lap) in self.laps.iter().enumerate() {
-                let split = lap.saturating_sub(previous);
-                previous = *lap;
-                ui.label(
-                    theme::secondary(
-                        p,
-                        format!(
-                            "{}. {}  (+{})",
-                            index + 1,
-                            format_span(*lap, true),
-                            format_span(split, true)
-                        ),
-                    )
-                    .size(12.5),
-                );
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if cancel {
+            self.dialog = None;
+            return;
+        }
+        let Some(start) = confirmed else {
+            return;
+        };
+        match self.dialog.take() {
+            Some(Dialog::Alarm {
+                hour,
+                minute,
+                label,
+                repeat,
+            }) => {
+                self.handle.update(|state| {
+                    let id = state.alarms.iter().map(|alarm| alarm.id).max().unwrap_or(0) + 1;
+                    state.alarms.push(Alarm {
+                        id,
+                        hour,
+                        minute,
+                        label: label.trim().to_owned(),
+                        enabled: true,
+                        repeat,
+                    });
+                    state.alarms.sort_by_key(|alarm| (alarm.hour, alarm.minute));
+                });
             }
-        });
+            Some(Dialog::Countdown {
+                hours,
+                minutes,
+                seconds,
+                label,
+            }) => {
+                let secs = hours * 3600 + minutes * 60 + seconds;
+                self.handle.update(|state| {
+                    let id = state
+                        .countdowns
+                        .iter()
+                        .map(|entry| entry.id)
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                    state.countdowns.push(Countdown {
+                        id,
+                        label: label.trim().to_owned(),
+                        secs,
+                        end: start.then(|| clock::unix_now() + secs as u64),
+                    });
+                });
+            }
+            None => {}
+        }
+        self.persist(shared);
     }
 }

@@ -49,6 +49,49 @@ pub struct Artwork {
     pub rgba: Vec<u8>,
 }
 
+impl Artwork {
+    /// Auffälligste Farbe des Covers: Pixel zählen umso mehr, je kräftiger (gesättigt und
+    /// hell genug) sie sind; ein graues Cover liefert seinen Durchschnitt.
+    pub fn dominant_color(&self) -> [u8; 3] {
+        let pixels = self.rgba.len() / 4;
+        if pixels == 0 {
+            return [128, 128, 128];
+        }
+        let stride = (pixels / 4000).max(1);
+        let (mut sum, mut weights) = ([0.0_f64; 3], 0.0_f64);
+        let (mut plain, mut count) = ([0.0_f64; 3], 0.0_f64);
+        for index in (0..pixels).step_by(stride) {
+            let [r, g, b] = [
+                self.rgba[index * 4] as f64,
+                self.rgba[index * 4 + 1] as f64,
+                self.rgba[index * 4 + 2] as f64,
+            ];
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            let saturation = if max > 0.0 { (max - min) / max } else { 0.0 };
+            let value = max / 255.0;
+            // Sehr dunkle und sehr blasse Pixel zählen kaum.
+            let weight = saturation * saturation * value.clamp(0.15, 1.0);
+            sum[0] += r * weight;
+            sum[1] += g * weight;
+            sum[2] += b * weight;
+            weights += weight;
+            plain[0] += r;
+            plain[1] += g;
+            plain[2] += b;
+            count += 1.0;
+        }
+        let pick = |channel: usize| {
+            if weights > 1.0 {
+                (sum[channel] / weights).round() as u8
+            } else {
+                (plain[channel] / count).round() as u8
+            }
+        };
+        [pick(0), pick(1), pick(2)]
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlaybackInfo {
     pub is_playing: bool,

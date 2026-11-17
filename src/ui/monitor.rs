@@ -1,6 +1,10 @@
 use crate::i18n::t;
+
+mod perf;
+mod startup_page;
+
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -15,10 +19,10 @@ use crate::{
     app::Shared,
     platform,
     services::{
+        hwinfo::{self, SystemStats},
         icons::{self, IconImage},
-        monitor::{
-            Command, DiskRow, GpuInfo, NetworkRow, PowerBreakdown, ProcessRow, Sample, State,
-        },
+        monitor::{Command, DiskRow, GpuInfo, NetworkRow, ProcessRow, Sample, State},
+        smart::{self, SmartInfo, Status},
         winsys::PhysicalDisk,
     },
     theme::{self, Palette},
@@ -26,7 +30,39 @@ use crate::{
 
 /// So viele Punkte zeichnet ein Diagramm höchstens – mehr sieht man ohnehin nicht.
 const MAX_CHART_POINTS: usize = 600;
-const CHART_HEIGHT: f32 = 170.0;
+/// Wählbare Messabstände in Millisekunden.
+const INTERVALS: [(u64, &str); 4] = [
+    (2000, "alle 2 s"),
+    (1000, "jede Sekunde"),
+    (500, "alle 0,5 s"),
+    (100, "alle 0,1 s"),
+];
+/// Höhe der Diagramme; wird je Seite so gewählt, dass alles ohne Scrollen passt.
+static CHART_HEIGHT_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x432A_0000); // 170.0
+
+fn chart_height() -> f32 {
+    f32::from_bits(CHART_HEIGHT_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn set_chart_height(height: f32) {
+    CHART_HEIGHT_BITS.store(height.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Größte Lücke zwischen zwei Messpunkten, die noch überbrückt wird: ein Mehrfaches des
+/// üblichen Abstands (Minutenwerte brauchen mehr als Sekundenwerte).
+fn gap_limit(samples: &[Sample]) -> f64 {
+    let mut gaps: Vec<f64> = samples
+        .windows(2)
+        .map(|pair| pair[1].secs() - pair[0].secs())
+        .filter(|gap| *gap > 0.0)
+        .collect();
+    if gaps.is_empty() {
+        return 90.0;
+    }
+    gaps.sort_by(f64::total_cmp);
+    (gaps[gaps.len() / 2] * 4.0).max(90.0)
+}
 const TIMELINE_HEIGHT: f32 = 64.0;
 const PROCESS_ROW_HEIGHT: f32 = 28.0;
 const MAX_PROCESS_ROWS: usize = 300;
@@ -38,8 +74,8 @@ enum Page {
     Processes,
     Performance,
     History,
+    Startup,
     Disks,
-    Energy,
 }
 
 impl Page {
@@ -47,8 +83,8 @@ impl Page {
         (Page::Processes, "Prozesse"),
         (Page::Performance, "Leistung"),
         (Page::History, "Verlauf"),
+        (Page::Startup, "Autostart"),
         (Page::Disks, "Datenträger"),
-        (Page::Energy, "Energie"),
     ];
 }
 
@@ -61,6 +97,8 @@ enum Range {
     Hour,
     Day,
     Week,
+    /// Frei gewählter Zeitraum (Länge in Sekunden).
+    Custom(u64),
 }
 
 impl Range {
@@ -79,6 +117,7 @@ impl Range {
             Range::Hour => "1 Stunde",
             Range::Day => "24 Stunden",
             Range::Week => "7 Tage",
+            Range::Custom(_) => "Eigener Zeitraum",
         }
     }
 
@@ -89,6 +128,7 @@ impl Range {
             Range::Hour => 3600,
             Range::Day => 86_400,
             Range::Week => 7 * 86_400,
+            Range::Custom(seconds) => seconds.max(60),
         }
     }
 
@@ -97,13 +137,17 @@ impl Range {
         match self {
             Range::Minute => 3600,
             Range::FiveMinutes | Range::Hour => 86_400,
-            Range::Day | Range::Week => 7 * 86_400,
+            Range::Day | Range::Week | Range::Custom(_) => 7 * 86_400,
         }
     }
 
     /// Lange Zeiträume kommen aus dem gespeicherten Minutenverlauf.
     fn uses_minutes(self) -> bool {
-        matches!(self, Range::Day | Range::Week)
+        match self {
+            Range::Week => true,
+            Range::Custom(seconds) => seconds > 2 * 86_400,
+            _ => false,
+        }
     }
 }
 
@@ -157,11 +201,22 @@ pub struct MonitorView {
     page: Page,
     range: Range,
     sort: Sort,
+    /// Umgekehrte Reihenfolge (ein zweiter Klick auf die Spalte).
+    sort_reversed: bool,
     device: Device,
     /// Gewählte Komponente auf der Seite „Verlauf“.
     history_device: Device,
     /// Verlauf: so viele Sekunden liegt das Ende des gezeigten Fensters zurück (0 = live).
     history_offset: u64,
+    /// Zeitleiste: gezeigter Zeitraum in Sekunden (0 = automatisch).
+    timeline_secs: u64,
+    /// Höhe der Zeitleiste in Pixeln (0 = Standard).
+    timeline_height: f32,
+    /// Frei gewählter Zeitraum (Anfang, Ende) als Zeitstempel.
+    custom: Option<(u64, u64)>,
+    custom_from: String,
+    custom_to: String,
+    custom_error: Option<String>,
 
     search: String,
     /// Name des markierten Programms in der Prozessliste.
@@ -171,8 +226,14 @@ pub struct MonitorView {
     /// Icons je Programmdatei; `None` = angefragt oder nicht vorhanden.
     icons: HashMap<String, Option<TextureHandle>>,
     icon_loader: Option<IconLoader>,
-    /// Anzahl der Zeilen in der Energie-Tabelle.
-    energy_rows: usize,
+    /// Offenes Fenster mit den Details eines Datenträgers (Nummer, SMART-Werte).
+    disk_popup: Option<(u32, SmartInfo)>,
+    /// Seite „Autostart“.
+    startup: startup_page::StartupView,
+    /// Liest Hardware-Angaben (Cache, Treiber, Adresse …); startet erst bei Bedarf.
+    hw: Option<hwinfo::Handle>,
+    /// Schalter „Erweitert“ auf der Seite „Leistung“.
+    advanced: bool,
 }
 
 // ───────── Hilfsfunktionen ─────────
@@ -260,16 +321,35 @@ fn collect_samples(state: &State, range: Range, now: u64) -> Vec<Sample> {
 /// Messpunkte zwischen zwei Zeitpunkten. Die feinen Werte reichen nur etwa eine Stunde
 /// zurück – für alles Ältere (oder mit `coarse`) dient der Minutenverlauf.
 fn collect_between(state: &State, start: u64, end: u64, coarse: bool) -> Vec<Sample> {
-    let recent_from = state.recent.front().map_or(u64::MAX, |sample| sample.time);
-    let source = if coarse || start + 60 < recent_from {
-        &state.minutes
+    // Feinste Stufe, die den Anfang des Zeitraums noch abdeckt: Live-Werte, 30-Sekunden-Werte,
+    // zuletzt Minutenwerte.
+    let covers =
+        |tier: &VecDeque<Sample>| tier.front().is_some_and(|first| start + 60 >= first.time);
+    let (source, is_live) = if !coarse && covers(&state.recent) {
+        (&state.recent, true)
+    } else if !coarse && covers(&state.thirty) {
+        (&state.thirty, false)
     } else {
-        &state.recent
+        (&state.minutes, false)
     };
-    let in_range: Vec<&Sample> = source
+    // Reicht die gröbere Stufe zurück, kommen die feinen Live-Werte des jüngsten Teils dazu.
+    let live_from = if coarse || is_live {
+        u64::MAX
+    } else {
+        state.recent.front().map_or(u64::MAX, |first| first.time)
+    };
+    let mut in_range: Vec<&Sample> = source
         .iter()
-        .filter(|sample| sample.time >= start && sample.time <= end)
+        .filter(|sample| sample.time >= start && sample.time <= end && sample.time < live_from)
         .collect();
+    if live_from != u64::MAX {
+        in_range.extend(
+            state
+                .recent
+                .iter()
+                .filter(|sample| sample.time >= start && sample.time <= end),
+        );
+    }
     let step = in_range.len().div_ceil(MAX_CHART_POINTS).max(1);
     let mut samples: Vec<Sample> = in_range
         .iter()
@@ -357,7 +437,7 @@ fn chart(
         }
     });
 
-    let size = egui::vec2(ui.available_width(), CHART_HEIGHT);
+    let size = egui::vec2(ui.available_width(), chart_height());
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
@@ -368,8 +448,8 @@ fn chart(
     let plot = rect.shrink2(egui::vec2(8.0, 10.0));
     let span = range.seconds() as f32;
     let start = now.saturating_sub(range.seconds());
-    let x_of = |time: u64| {
-        plot.left() + (time.saturating_sub(start) as f32 / span).clamp(0.0, 1.0) * plot.width()
+    let x_of = |time: f64| {
+        plot.left() + (((time - start as f64) / span as f64) as f32).clamp(0.0, 1.0) * plot.width()
     };
     let y_of = |value: f32| plot.bottom() - (value / max).clamp(0.0, 1.0) * plot.height();
 
@@ -389,10 +469,10 @@ fn chart(
     }
 
     // Größere Lücken (App war aus, Rechner im Ruhezustand) nicht überbrücken.
-    let max_gap = (range.seconds() / 40).max(if range.uses_minutes() { 180 } else { 25 });
+    let max_gap = gap_limit(samples).max(range.seconds() as f64 / 40.0);
     for line in lines {
         let mut segment: Vec<Pos2> = Vec::new();
-        let mut previous_time = 0u64;
+        let mut previous_time = 0.0f64;
         let flush = |segment: &mut Vec<Pos2>| {
             if segment.len() > 1 {
                 fill_below(
@@ -412,11 +492,11 @@ fn chart(
         for sample in samples {
             match (line.value)(sample) {
                 Some(value) => {
-                    if !segment.is_empty() && sample.time.saturating_sub(previous_time) > max_gap {
+                    if !segment.is_empty() && sample.secs() - previous_time > max_gap {
                         flush(&mut segment);
                     }
-                    segment.push(Pos2::new(x_of(sample.time), y_of(value)));
-                    previous_time = sample.time;
+                    segment.push(Pos2::new(x_of(sample.secs()), y_of(value)));
+                    previous_time = sample.secs();
                 }
                 None => flush(&mut segment),
             }
@@ -457,15 +537,15 @@ fn chart(
         return;
     };
     let nearest = samples.iter().min_by(|a, b| {
-        (x_of(a.time) - pointer.x)
+        (x_of(a.secs()) - pointer.x)
             .abs()
-            .total_cmp(&(x_of(b.time) - pointer.x).abs())
+            .total_cmp(&(x_of(b.secs()) - pointer.x).abs())
     });
     let Some(sample) = nearest else {
         return;
     };
     painter.vline(
-        x_of(sample.time),
+        x_of(sample.secs()),
         plot.y_range(),
         Stroke::new(1.0_f32, p.text_secondary),
     );
@@ -546,16 +626,6 @@ fn sparkline(
     painter.add(Shape::line(points, Stroke::new(1.2_f32, color)));
 }
 
-/// Beschriftung über einem Wert, wie in den Detailfeldern des Task-Managers.
-fn detail(ui: &mut Ui, p: &Palette, label: &str, value: String) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.label(theme::secondary(p, label).size(12.0));
-        ui.label(RichText::new(value).size(17.0));
-    });
-    ui.add_space(18.0);
-}
-
 /// Höchster Wert einer Reihe, mit etwas Luft und Untergrenze – als Diagramm-Obergrenze.
 fn headroom(samples: &[Sample], value: impl Fn(&Sample) -> f32, minimum: f32) -> f32 {
     let peak = samples.iter().map(value).fold(0.0f32, f32::max);
@@ -563,8 +633,46 @@ fn headroom(samples: &[Sample], value: impl Fn(&Sample) -> f32, minimum: f32) ->
 }
 
 /// Gut sichtbarer Pfeil neben der Spalte, nach der sortiert wird.
-fn sort_arrow(ui: &Ui, center: Pos2, color: Color32) {
-    let (half_width, half_height) = (6.0, 4.0);
+/// Gespeicherte Spaltenbreiten, sonst die Standardwerte.
+fn column_widths<const N: usize>(saved: &[f32], default: [f32; N]) -> [f32; N] {
+    if saved.len() == N {
+        let mut widths = default;
+        for (width, value) in widths.iter_mut().zip(saved) {
+            *width = value.clamp(60.0, 700.0);
+        }
+        widths
+    } else {
+        default
+    }
+}
+
+/// Anfasser zum Verschieben einer Spaltengrenze. Liefert (Verschiebung nach rechts, losgelassen).
+fn resize_handle(
+    ui: &mut Ui,
+    id: egui::Id,
+    x: f32,
+    top: f32,
+    bottom: f32,
+    p: &Palette,
+) -> (f32, bool) {
+    let rect = Rect::from_min_max(Pos2::new(x - 4.0, top), Pos2::new(x + 4.0, bottom));
+    let response = ui.interact(rect, id, Sense::drag());
+    let active = response.hovered() || response.dragged();
+    let color = if active {
+        p.text_secondary
+    } else {
+        p.text_secondary.gamma_multiply(0.3)
+    };
+    ui.painter()
+        .vline(x, (top + 6.0)..=(bottom - 6.0), Stroke::new(1.0_f32, color));
+    if active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    (response.drag_delta().x, response.drag_stopped())
+}
+
+fn sort_arrow(ui: &Ui, center: Pos2, color: Color32, up: bool) {
+    let (half_width, half_height) = (6.0, if up { -4.0 } else { 4.0 });
     ui.painter().add(Shape::convex_polygon(
         vec![
             Pos2::new(center.x - half_width, center.y - half_height),
@@ -596,7 +704,8 @@ struct Hardware {
     disk_letters: Vec<String>,
     physical: Vec<PhysicalDisk>,
     networks: Vec<NetworkRow>,
-    power: PowerBreakdown,
+    stats: SystemStats,
+    disk_latency: Vec<f32>,
 }
 
 impl Hardware {
@@ -616,7 +725,8 @@ impl Hardware {
             disk_letters: state.disk_letters.clone(),
             physical: state.physical_disks.clone(),
             networks: state.networks.clone(),
-            power: state.power.clone(),
+            stats: state.system,
+            disk_latency: state.disk_latency.clone(),
         }
     }
 
@@ -773,7 +883,145 @@ fn chart_card(
     });
 }
 
-/// Die Diagramme eines Geräts. `with_power` ergänzt die Leistungsaufnahme (Verlauf).
+/// Anzahl der Diagramme, die ein Gerät zeigt.
+fn chart_count(device: Device, samples: &[Sample]) -> usize {
+    match device {
+        Device::Cpu => 1 + usize::from(samples.iter().any(|s| s.cpu_temp.is_some())),
+        Device::Gpu(index) => {
+            1 + usize::from(samples.iter().any(|s| gpu_value(s, index, 1).is_some()))
+        }
+        Device::Disk(_) => 2,
+        Device::Memory | Device::Network => 1,
+    }
+}
+
+/// Wählt die Diagrammhöhe so, dass `charts` Diagramme plus `reserved` Pixel für alles andere
+/// in den sichtbaren Rest des Fensters passen – ohne Scrollen.
+fn fit_charts(ui: &Ui, charts: usize, reserved: f32) {
+    // Je Karte: Titel, Legende, Ränder.
+    const CARD_OVERHEAD: f32 = 88.0;
+    // Die Höhe wird gemerkt: würde sie in jedem Bild aus der Scrollposition abgeleitet,
+    // wüchsen die Diagramme beim Scrollen.
+    let key = egui::Id::new((
+        "fit-charts",
+        ui.clip_rect().height().round() as i32,
+        charts,
+        reserved.round() as i32,
+    ));
+    let per_chart = ui
+        .data(|data| data.get_temp::<f32>(key))
+        .unwrap_or_else(|| {
+            let remaining = (ui.clip_rect().bottom() - ui.next_widget_position().y).max(0.0);
+            let height =
+                ((remaining - reserved) / charts.max(1) as f32 - CARD_OVERHEAD).clamp(110.0, 420.0);
+            ui.data_mut(|data| data.insert_temp(key, height));
+            height
+        });
+    set_chart_height(per_chart);
+}
+
+/// Wählbare Aufbewahrungsdauer des Verlaufs in Tagen.
+const RETENTION_DAYS: [u32; 5] = [1, 3, 7, 14, 30];
+
+fn retention_label(days: u32) -> String {
+    if days == 1 {
+        t("1 Tag").to_owned()
+    } else {
+        crate::i18n::td(format!("{days} Tage"))
+    }
+}
+
+/// Wählbarer Zeitraum der Zeitleiste (Sekunden, Beschriftung).
+const TIMELINE_SPANS: [(u64, &str); 8] = [
+    (0, "Automatisch"),
+    (3600, "1 Stunde"),
+    (21_600, "6 Stunden"),
+    (86_400, "24 Stunden"),
+    (259_200, "3 Tage"),
+    (604_800, "7 Tage"),
+    (1_209_600, "14 Tage"),
+    (2_592_000, "30 Tage"),
+];
+
+/// Tage seit 1970 für ein Kalenderdatum (Algorithmus nach Howard Hinnant).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Liest einen Zeitpunkt in Ortszeit: `10.12.2025 14:30`, `10.12.2025`, `10.12. 14:30`,
+/// `2025-12-10 14:30` oder nur `10:00` (heute). Ohne Uhrzeit gilt der Tagesanfang, am Ende
+/// eines Zeitraums (`end_of_range`) das Tagesende. `today` ist (Jahr, Monat, Tag).
+fn parse_moment(
+    text: &str,
+    today: (i64, i64, i64),
+    offset: i64,
+    end_of_range: bool,
+) -> Option<u64> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    let mut date: Option<(i64, i64, i64)> = None;
+    let mut time: Option<(i64, i64, i64)> = None;
+    for part in text.split_whitespace() {
+        if part.contains(':') {
+            let mut fields = part.split(':');
+            let hour: i64 = fields.next()?.parse().ok()?;
+            let minute: i64 = fields.next()?.parse().ok()?;
+            let second: i64 = match fields.next() {
+                Some(field) => field.parse().ok()?,
+                None => 0,
+            };
+            time = Some((hour, minute, second));
+        } else if part.contains('.') || part.contains('-') {
+            let numbers: Vec<i64> = part
+                .split(['.', '-'])
+                .filter(|field| !field.is_empty())
+                .map(|field| field.parse().ok())
+                .collect::<Option<Vec<_>>>()?;
+            date = Some(match numbers.as_slice() {
+                [first, month, day] if *first > 31 => (*first, *month, *day),
+                [day, month, year] => {
+                    (if *year < 100 { 2000 + *year } else { *year }, *month, *day)
+                }
+                [day, month] => (today.0, *month, *day),
+                _ => return None,
+            });
+        } else {
+            return None;
+        }
+    }
+    let (year, month, day) = date.unwrap_or(today);
+    let (hour, minute, second) = time.unwrap_or((0, 0, 0));
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..60).contains(&second)
+        || !(1970..=2200).contains(&year)
+    {
+        return None;
+    }
+    let mut seconds =
+        days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second - offset;
+    if time.is_none() && end_of_range {
+        seconds += 86_400;
+    }
+    u64::try_from(seconds).ok()
+}
+
+/// `10.12.2025 14:30` in Ortszeit.
+fn format_full(time: u64) -> String {
+    let (year, month, day, hour, minute) = platform::local_parts(time);
+    format!("{day:02}.{month:02}.{year} {hour:02}:{minute:02}")
+}
+
+/// Die Diagramme eines Geräts.
 fn device_charts(
     ui: &mut Ui,
     p: &Palette,
@@ -781,10 +1029,8 @@ fn device_charts(
     samples: &[Sample],
     range: Range,
     now: u64,
-    with_power: bool,
 ) {
     let (first, second, third) = series_colors(p);
-    let watts = |value: fn(&Sample) -> f32| (headroom(samples, value, 10.0) / 10.0).ceil() * 10.0;
     match device {
         Device::Cpu => {
             let lines = [Line {
@@ -807,25 +1053,6 @@ fn device_charts(
                     &lines,
                     100.0,
                     "°C",
-                    range,
-                    now,
-                );
-            }
-            if with_power {
-                let lines = [Line {
-                    label: "Leistung",
-                    color: third,
-                    value: &|s| Some(s.cpu_w),
-                }];
-                let max = watts(|s| s.cpu_w);
-                chart_card(
-                    ui,
-                    p,
-                    "Leistungsaufnahme",
-                    samples,
-                    &lines,
-                    max,
-                    "W",
                     range,
                     now,
                 );
@@ -870,25 +1097,6 @@ fn device_charts(
                     &lines,
                     100.0,
                     "°C",
-                    range,
-                    now,
-                );
-            }
-            if with_power {
-                let lines = [Line {
-                    label: "Leistung aller Grafikkarten",
-                    color: first,
-                    value: &|s| Some(s.gpu_w),
-                }];
-                let max = watts(|s| s.gpu_w);
-                chart_card(
-                    ui,
-                    p,
-                    "Leistungsaufnahme",
-                    samples,
-                    &lines,
-                    max,
-                    "W",
                     range,
                     now,
                 );
@@ -973,214 +1181,66 @@ fn format_uptime(seconds: u64) -> String {
     )
 }
 
-fn measured_label(measured: bool) -> &'static str {
-    if measured {
-        "gemessen"
-    } else {
-        "geschätzt"
+impl MonitorView {
+    /// Ansicht aktualisieren: Autostart, Laufwerke und Netzwerkangaben neu lesen.
+    pub fn refresh(&mut self, ctx: &egui::Context, shared: &mut Shared) {
+        self.startup.reload(ctx);
+        if let Some(hw) = &self.hw {
+            hw.refresh_network();
+        }
+        shared.monitor.send(Command::RefreshDisks);
     }
-}
 
-/// Kennzahlen des Geräts unter den Diagrammen.
-fn device_facts(ui: &mut Ui, p: &Palette, device: Device, hardware: &Hardware, last: &Sample) {
-    let unknown = || "nicht verfügbar".to_owned();
-    match device {
-        Device::Cpu => {
-            ui.horizontal_wrapped(|ui| {
-                detail(ui, p, t("Auslastung"), format!("{:.0} %", last.cpu));
-                if hardware.cpu_mhz > 0 {
-                    let speed = format!("{:.2} GHz", hardware.cpu_mhz as f32 / 1000.0);
-                    detail(ui, p, t("Geschwindigkeit"), speed.replace('.', ","));
-                }
-                detail(ui, p, t("Prozesse"), hardware.process_count.to_string());
-                detail(
-                    ui,
-                    p,
-                    t("Logische Prozessoren"),
-                    hardware.cpu_cores.to_string(),
-                );
-                detail(ui, p, t("Betriebszeit"), format_uptime(hardware.uptime));
-                let temperature = last.cpu_temp.map_or_else(unknown, |t| format!("{t:.0} °C"));
-                detail(ui, p, t("Temperatur"), temperature);
-                let power = format!(
-                    "{:.0} W ({})",
-                    hardware.power.cpu_w,
-                    measured_label(hardware.power.cpu_measured)
-                );
-                detail(ui, p, t("Leistung"), power);
-            });
-
-            // Auslastung je logischem Prozessor als Balkenreihe.
-            if !hardware.cores.is_empty() {
-                ui.add_space(6.0);
-                ui.label(theme::secondary(p, t("Logische Prozessoren")).size(12.0));
-                let (cell, gap) = (egui::vec2(26.0, 44.0), 4.0);
-                let per_row = ((ui.available_width() + gap) / (cell.x + gap))
-                    .floor()
-                    .max(1.0) as usize;
-                let rows = hardware.cores.len().div_ceil(per_row);
-                let size = egui::vec2(ui.available_width(), rows as f32 * (cell.y + gap));
-                let (area, _) = ui.allocate_exact_size(size, Sense::hover());
-                for (index, usage) in hardware.cores.iter().enumerate() {
-                    let offset = egui::vec2(
-                        (index % per_row) as f32 * (cell.x + gap),
-                        (index / per_row) as f32 * (cell.y + gap),
-                    );
-                    let rect = Rect::from_min_size(area.min + offset, cell);
-                    ui.painter().rect_filled(rect, 2.0, p.field_bg);
-                    let mut fill = rect;
-                    fill.set_top(rect.bottom() - rect.height() * (usage / 100.0).clamp(0.0, 1.0));
-                    ui.painter()
-                        .rect_filled(fill, 2.0, p.accent.gamma_multiply(0.75));
-                    ui.painter()
-                        .rect_stroke(rect, 2.0, Stroke::new(1.0_f32, p.separator));
-                    ui.painter().text(
-                        Pos2::new(rect.center().x, rect.bottom() - 2.0),
-                        Align2::CENTER_BOTTOM,
-                        format!("{usage:.0}"),
-                        FontId::proportional(10.5),
-                        p.text,
-                    );
+    /// Seitenwahl; steht fest oben, außerhalb des Scrollbereichs.
+    pub fn header(&mut self, ui: &mut Ui, shared: &mut Shared) {
+        let p = shared.palette;
+        ui.horizontal(|ui| {
+            for (page, label) in Page::ALL {
+                if theme::chip(ui, &p, t(label), self.page == page).clicked() {
+                    self.page = page;
                 }
             }
-        }
-        Device::Memory => {
-            ui.horizontal_wrapped(|ui| {
-                detail(ui, p, t("In Verwendung"), format_bytes(hardware.used_ram));
-                let free = hardware.total_ram.saturating_sub(hardware.used_ram);
-                detail(ui, p, t("Verfügbar"), format_bytes(free));
-                detail(ui, p, t("Gesamt"), format_bytes(hardware.total_ram));
-                if hardware.swap_total > 0 {
-                    let swap = format!(
-                        "{} / {}",
-                        format_bytes(hardware.swap_used),
-                        format_bytes(hardware.swap_total)
-                    );
-                    detail(ui, p, t("Auslagerungsdatei"), swap);
-                }
-                detail(
-                    ui,
-                    p,
-                    t("Leistung (geschätzt)"),
-                    format!("{:.0} W", hardware.power.ram_w),
-                );
-            });
-        }
-        Device::Gpu(index) => {
-            ui.horizontal_wrapped(|ui| {
-                let usage = gpu_value(last, index, 0)
-                    .map_or_else(|| "–".to_owned(), |u| format!("{u:.0} %"));
-                detail(ui, p, t("Auslastung"), usage);
-                let temperature =
-                    gpu_value(last, index, 1).map_or_else(unknown, |t| format!("{t:.0} °C"));
-                detail(ui, p, t("Temperatur"), temperature);
-                if let Some(memory) = hardware.gpus.get(index).and_then(|gpu| gpu.memory_used) {
-                    detail(
-                        ui,
-                        p,
-                        t("Dedizierter Speicher belegt"),
-                        format_bytes(memory),
-                    );
-                }
-                let power = format!(
-                    "{:.0} W ({})",
-                    hardware.power.gpu_w,
-                    measured_label(hardware.power.gpu_measured)
-                );
-                detail(ui, p, t("Leistung aller Grafikkarten"), power);
-            });
-        }
-        Device::Disk(index) => {
-            ui.horizontal_wrapped(|ui| {
-                let active = disk_value(last, index, 2).unwrap_or(0.0);
-                detail(ui, p, t("Aktive Zeit"), format!("{active:.0} %"));
-                detail(
-                    ui,
-                    p,
-                    t("Lesen"),
-                    format_rate(disk_value(last, index, 0).unwrap_or(0.0)),
-                );
-                detail(
-                    ui,
-                    p,
-                    t("Schreiben"),
-                    format_rate(disk_value(last, index, 1).unwrap_or(0.0)),
-                );
-                if let Some(disk) = hardware.physical_disk(index) {
-                    detail(ui, p, t("Kapazität"), format_bytes(disk.size));
-                    if !disk.bus.is_empty() {
-                        detail(ui, p, t("Anschluss"), disk.bus.clone());
-                    }
-                    if !disk.style.is_empty() {
-                        detail(ui, p, t("Partitionsstil"), disk.style.clone());
-                    }
-                    detail(ui, p, t("Partitionen"), disk.partitions.len().to_string());
-                }
-            });
-        }
-        Device::Network => {
-            ui.horizontal_wrapped(|ui| {
-                detail(ui, p, t("Empfangen"), format_rate(last.net_down));
-                detail(ui, p, t("Gesendet"), format_rate(last.net_up));
-            });
-            if !hardware.networks.is_empty() {
-                ui.add_space(6.0);
-                egui::Grid::new("monitor-networks")
-                    .num_columns(3)
-                    .striped(true)
-                    .spacing(egui::vec2(24.0, 5.0))
-                    .show(ui, |ui| {
-                        for title in ["Adapter", "Empfangen", "Gesendet"] {
-                            ui.label(theme::secondary(p, title).size(12.5));
-                        }
-                        ui.end_row();
-                        for network in &hardware.networks {
-                            ui.label(network.name.as_str());
-                            ui.label(format_rate(network.down));
-                            ui.label(format_rate(network.up));
-                            ui.end_row();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let current = INTERVALS
+                    .iter()
+                    .find(|(millis, _)| *millis == shared.settings.monitor_interval_ms)
+                    .map_or("Eigene", |(_, label)| *label);
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("monitor-interval")
+                    .selected_text(t(current))
+                    .show_ui(ui, |ui| {
+                        for (millis, label) in INTERVALS {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut shared.settings.monitor_interval_ms,
+                                    millis,
+                                    t(label),
+                                )
+                                .clicked();
                         }
                     });
-            }
-        }
+                ui.label(theme::secondary(&p, t("Aktualisierung:")).size(12.5));
+                if changed {
+                    shared.save_settings();
+                }
+            });
+        });
+        ui.add_space(4.0);
     }
-}
 
-impl MonitorView {
     pub fn ui(&mut self, ui: &mut Ui, shared: &mut Shared) {
         if let Some(message) = shared.monitor.take_message() {
             shared.notify(message);
         }
         self.receive_icons(ui);
-        let p = shared.palette;
-
-        ui.horizontal(|ui| {
-            for (page, label) in Page::ALL {
-                if theme::chip(ui, &p, label, self.page == page).clicked() {
-                    self.page = page;
-                }
-            }
-        });
-        ui.add_space(4.0);
 
         match self.page {
             Page::Processes => self.processes(ui, shared),
             Page::Performance => self.performance(ui, shared),
             Page::History => self.history(ui, shared),
+            Page::Startup => self.startup.ui(ui, shared),
             Page::Disks => self.disks(ui, shared),
-            Page::Energy => self.energy(ui, shared),
         }
-    }
-
-    fn range_chips(&mut self, ui: &mut Ui, p: &Palette) {
-        ui.horizontal(|ui| {
-            ui.label(theme::secondary(p, t("Zeitraum")).size(12.5));
-            for range in Range::ALL {
-                if theme::chip(ui, p, range.label(), self.range == range).clicked() {
-                    self.range = range;
-                }
-            }
-        });
     }
 
     // ───────── Icons ─────────
@@ -1239,12 +1299,11 @@ impl MonitorView {
                     last.map_or(0.0, |s| s.disk_read + s.disk_write),
                 )
             });
-        let total = rows.len();
-
         let needle = self.search.trim().to_lowercase();
         if !needle.is_empty() {
             rows.retain(|row| row.name.to_lowercase().contains(&needle));
         }
+        let total = rows.len();
         match self.sort {
             Sort::Cpu => rows.sort_by(|a, b| b.cpu.total_cmp(&a.cpu)),
             Sort::Memory => rows.sort_by(|a, b| b.memory.cmp(&a.memory)),
@@ -1252,6 +1311,9 @@ impl MonitorView {
                 (b.disk_read + b.disk_write).total_cmp(&(a.disk_read + a.disk_write))
             }),
             Sort::Name => rows.sort_by_key(|row| row.name.to_lowercase()),
+        }
+        if self.sort_reversed {
+            rows.reverse();
         }
         rows.truncate(MAX_PROCESS_ROWS);
         self.request_icons(ui, rows.iter());
@@ -1262,7 +1324,10 @@ impl MonitorView {
             .as_ref()
             .and_then(|name| rows.iter().find(|row| &row.name == name))
             .cloned();
-        if selected_row.is_none() {
+        if selected_row.is_none()
+            || (self.confirm_kill.is_none()
+                && ui.input(|input| input.key_pressed(egui::Key::Escape)))
+        {
             self.selected = None;
         }
 
@@ -1277,6 +1342,16 @@ impl MonitorView {
                     if let Some(row) = &selected_row {
                         self.confirm_kill = Some((row.name.clone(), row.pids.clone()));
                     }
+                }
+                if ui
+                    .add_enabled(
+                        selected_row.is_some(),
+                        egui::Button::new(t("Auswahl aufheben")),
+                    )
+                    .on_hover_text(t("Hebt die Markierung in der Liste auf (Esc)"))
+                    .clicked()
+                {
+                    self.selected = None;
                 }
                 ui.label(
                     theme::secondary(&p, crate::i18n::td(format!("{total} Programme"))).size(12.5),
@@ -1323,6 +1398,9 @@ impl MonitorView {
         }
 
         let mut open_error = None;
+        let mut widths = column_widths(&shared.settings.process_columns, [110.0, 120.0, 110.0]);
+        let mut widths_changed = false;
+        let mut widths_saved = false;
         theme::card(&p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 1.0;
@@ -1331,27 +1409,29 @@ impl MonitorView {
             let (header, _) =
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::hover());
             let disk_right = header.right() - 12.0;
-            let memory_right = disk_right - 110.0;
-            let cpu_right = memory_right - 120.0;
-            let name_right = cpu_right - 80.0;
+            let memory_right = disk_right - widths[2];
+            let cpu_right = memory_right - widths[1];
+            let name_right = cpu_right - widths[0];
             let columns = [
-                ("CPU", format!("{cpu_total:.0} %"), Sort::Cpu, cpu_right),
+                ("CPU", format!("{cpu_total:.0} %"), Sort::Cpu, cpu_right, 0),
                 (
                     "Arbeitsspeicher",
                     format!("{ram_total:.0} %"),
                     Sort::Memory,
                     memory_right,
+                    1,
                 ),
                 (
                     "Datenträger",
                     format_rate(disk_total),
                     Sort::Disk,
                     disk_right,
+                    2,
                 ),
             ];
-            for (label, value, sort, right) in columns {
+            for (label, value, sort, right, index) in columns {
                 let rect = Rect::from_min_max(
-                    Pos2::new(right - 105.0, header.top()),
+                    Pos2::new(right - widths[index] + 8.0, header.top()),
                     Pos2::new(right + 4.0, header.bottom()),
                 );
                 let response = ui.interact(
@@ -1380,11 +1460,33 @@ impl MonitorView {
                         ui,
                         Pos2::new(label_rect.left() - 11.0, label_rect.center().y),
                         p.text,
+                        self.sort_reversed,
                     );
                 }
                 if response.clicked() {
-                    self.sort = sort;
+                    if self.sort == sort {
+                        self.sort_reversed = !self.sort_reversed;
+                    } else {
+                        self.sort = sort;
+                        self.sort_reversed = false;
+                    }
                 }
+                let room = (header.width() - 24.0 - 150.0 - widths.iter().sum::<f32>()
+                    + widths[index])
+                    .max(60.0);
+                let (delta, stopped) = resize_handle(
+                    ui,
+                    ui.id().with(("process-resize", label)),
+                    right - widths[index],
+                    header.top(),
+                    header.bottom(),
+                    &p,
+                );
+                if delta != 0.0 {
+                    widths[index] = (widths[index] - delta).clamp(60.0, room.min(700.0));
+                    widths_changed = true;
+                }
+                widths_saved |= stopped;
             }
             let name_rect =
                 Rect::from_min_max(header.left_top(), Pos2::new(name_right, header.bottom()));
@@ -1409,10 +1511,16 @@ impl MonitorView {
                     ui,
                     Pos2::new(name_label.right() + 11.0, name_label.center().y),
                     p.text,
+                    self.sort_reversed,
                 );
             }
             if name_response.clicked() {
-                self.sort = Sort::Name;
+                if self.sort == Sort::Name {
+                    self.sort_reversed = !self.sort_reversed;
+                } else {
+                    self.sort = Sort::Name;
+                    self.sort_reversed = false;
+                }
             }
             ui.separator();
 
@@ -1481,17 +1589,23 @@ impl MonitorView {
                         // Zellen werden mit steigender Last kräftiger hinterlegt.
                         let disk = row.disk_read + row.disk_write;
                         let cells = [
-                            (cpu_right, format_percent(row.cpu), row.cpu / 50.0),
+                            (cpu_right, 0, format_percent(row.cpu), row.cpu / 50.0),
                             (
                                 memory_right,
+                                1,
                                 format_bytes(row.memory),
                                 row.memory as f32 / 4.0e9,
                             ),
-                            (disk_right, format_rate(disk), disk / (50.0 * BYTES_PER_MB)),
+                            (
+                                disk_right,
+                                2,
+                                format_rate(disk),
+                                disk / (50.0 * BYTES_PER_MB),
+                            ),
                         ];
-                        for (right, text, heat) in cells {
+                        for (right, index, text, heat) in cells {
                             let cell = Rect::from_min_max(
-                                Pos2::new(right - 100.0, rect.top() + 1.0),
+                                Pos2::new(right - widths[index] + 10.0, rect.top() + 1.0),
                                 Pos2::new(right + 6.0, rect.bottom() - 1.0),
                             );
                             let strength = 0.08 + 0.5 * heat.clamp(0.0, 1.0);
@@ -1532,6 +1646,12 @@ impl MonitorView {
                 ui.label(theme::secondary(&p, t("Keine Programme gefunden.")));
             }
         });
+        if widths_changed {
+            shared.settings.process_columns = widths.to_vec();
+        }
+        if widths_saved {
+            shared.save_settings();
+        }
         if let Some(err) = open_error {
             shared.notify(crate::i18n::td(format!("Dateisystem: {err}")));
         }
@@ -1542,10 +1662,16 @@ impl MonitorView {
     fn performance(&mut self, ui: &mut Ui, shared: &mut Shared) {
         let p = shared.palette;
         let now = unix_now();
-        let (samples, hardware) = shared.monitor.read(|state| {
+        let want_cores = self.advanced && self.device == Device::Cpu;
+        let (samples, hardware, cores) = shared.monitor.read(|state| {
             (
                 collect_samples(state, Range::Minute, now),
                 Hardware::from_state(state),
+                if want_cores {
+                    state.core_history.iter().cloned().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                },
             )
         });
         let last = samples.last().cloned().unwrap_or_default();
@@ -1553,6 +1679,15 @@ impl MonitorView {
         if !devices.contains(&self.device) {
             self.device = Device::Cpu;
         }
+        let on_network = self.device == Device::Network;
+        let hw_info = {
+            let ctx = ui.ctx().clone();
+            let handle = self.hw.get_or_insert_with(|| hwinfo::Handle::spawn(ctx));
+            if on_network {
+                handle.refresh_network();
+            }
+            handle.get()
+        };
         let net_max = headroom(&samples, |s| (s.net_down + s.net_up) / BYTES_PER_MB, 0.5);
 
         ui.horizontal_top(|ui| {
@@ -1610,15 +1745,31 @@ impl MonitorView {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(hardware.title(device)).size(24.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::chip(ui, &p, t("Erweitert"), self.advanced)
+                            .on_hover_text(t(
+                                "Zeigt einzelne Kerne, Cache-Größen und weitere Angaben",
+                            ))
+                            .clicked()
+                        {
+                            self.advanced = !self.advanced;
+                        }
                         ui.add(
                             egui::Label::new(theme::secondary(&p, hardware.model(device)))
                                 .truncate(),
                         );
                     });
                 });
-                device_charts(ui, &p, device, &samples, Range::Minute, now, false);
-                ui.add_space(4.0);
-                device_facts(ui, &p, device, &hardware, &last);
+                let info = perf::Info {
+                    p: &p,
+                    device,
+                    hardware: &hardware,
+                    hw: &hw_info,
+                    samples: &samples,
+                    last: &last,
+                    advanced: self.advanced,
+                    cores: &cores,
+                };
+                perf::body(ui, &info);
             });
         });
     }
@@ -1628,18 +1779,45 @@ impl MonitorView {
     fn history(&mut self, ui: &mut Ui, shared: &mut Shared) {
         let p = shared.palette;
         let now = unix_now();
-        let range = self.range;
-        let span = range.overview_seconds();
-        // Das Fenster darf höchstens bis zum Anfang der Zeitleiste zurückreichen.
-        self.history_offset = self
-            .history_offset
-            .min(span.saturating_sub(range.seconds()));
-        let end = now.saturating_sub(self.history_offset);
-        let start = end.saturating_sub(range.seconds());
+        let retention = u64::from(shared.settings.history_days.clamp(1, 30)) * 86_400;
+        if self.timeline_height < 40.0 {
+            self.timeline_height = 90.0;
+        }
+        let timeline_height = self.timeline_height.clamp(60.0, 320.0);
+
+        // Gezeigtes Fenster: frei gewählter Zeitraum oder die Voreinstellung bis „jetzt“.
+        let range = match self.custom {
+            Some((from, to)) => Range::Custom(to.saturating_sub(from)),
+            None => self.range,
+        };
+        let window = range.seconds();
+        let mut span = if self.timeline_secs == 0 {
+            range.overview_seconds()
+        } else {
+            self.timeline_secs
+        };
+        if let Some((from, _)) = self.custom {
+            span = span.max(now.saturating_sub(from) + window / 20 + 60);
+        }
+        span = span.min(retention).max(600);
+        let (start, end) = match self.custom {
+            Some((from, to)) => (from, to),
+            None => {
+                // Das Fenster darf höchstens bis zum Anfang der Zeitleiste zurückreichen.
+                self.history_offset = self.history_offset.min(span.saturating_sub(window));
+                let end = now.saturating_sub(self.history_offset);
+                (end.saturating_sub(window), end)
+            }
+        };
         let (samples, overview, hardware) = shared.monitor.read(|state| {
             (
-                collect_between(state, start, end, range.uses_minutes()),
-                collect_between(state, now.saturating_sub(span), now, span > 3600),
+                collect_between(
+                    state,
+                    start,
+                    end,
+                    range.uses_minutes() || start < now.saturating_sub(172_800),
+                ),
+                collect_between(state, now.saturating_sub(span), now, span > 172_800),
                 Hardware::from_state(state),
             )
         });
@@ -1664,39 +1842,190 @@ impl MonitorView {
             }
             ui.add_space(10.0);
             egui::ComboBox::from_id_salt("monitor-history-range")
-                .selected_text(self.range.label())
+                .selected_text(t(range.label()))
                 .show_ui(ui, |ui| {
                     for option in Range::ALL {
-                        ui.selectable_value(&mut self.range, option, option.label());
+                        if ui
+                            .selectable_value(&mut self.range, option, t(option.label()))
+                            .clicked()
+                        {
+                            self.custom = None;
+                            self.custom_error = None;
+                        }
                     }
                 });
+            ui.add_space(6.0);
+            ui.label(theme::secondary(&p, t("Gespeichert:")).size(12.5));
+            let days = shared.settings.history_days;
+            let mut changed = false;
+            egui::ComboBox::from_id_salt("monitor-history-retention")
+                .selected_text(retention_label(days))
+                .show_ui(ui, |ui| {
+                    for option in RETENTION_DAYS {
+                        changed |= ui
+                            .selectable_value(
+                                &mut shared.settings.history_days,
+                                option,
+                                retention_label(option),
+                            )
+                            .clicked();
+                    }
+                });
+            if changed {
+                shared.save_settings();
+            }
         });
 
-        device_charts(ui, &p, self.history_device, &samples, range, end, true);
+        // Zeitleiste und frei wählbarer Zeitraum.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::secondary(&p, t("Zeitleiste:")).size(12.5));
+            let selected = TIMELINE_SPANS
+                .iter()
+                .find(|(secs, _)| *secs == self.timeline_secs)
+                .map_or("Automatisch", |(_, label)| *label);
+            egui::ComboBox::from_id_salt("monitor-timeline-span")
+                .selected_text(t(selected))
+                .show_ui(ui, |ui| {
+                    for (secs, label) in TIMELINE_SPANS {
+                        ui.selectable_value(&mut self.timeline_secs, secs, t(label));
+                    }
+                });
+            ui.label(theme::secondary(&p, t("Höhe:")).size(12.5));
+            ui.spacing_mut().slider_width = 90.0;
+            ui.add(egui::Slider::new(&mut self.timeline_height, 60.0..=320.0).show_value(false));
+            ui.add_space(10.0);
+            ui.label(theme::secondary(&p, t("Von")).size(12.5));
+            ui.add(
+                TextEdit::singleline(&mut self.custom_from)
+                    .hint_text("TT.MM.JJJJ HH:MM")
+                    .desired_width(130.0),
+            );
+            ui.label(theme::secondary(&p, t("bis")).size(12.5));
+            ui.add(
+                TextEdit::singleline(&mut self.custom_to)
+                    .hint_text("TT.MM.JJJJ HH:MM")
+                    .desired_width(130.0),
+            );
+            let today = platform::local_parts(now);
+            let offset = platform::local_offset_secs();
+            let mut apply = false;
+            if ui
+                .button(t("Anwenden"))
+                .on_hover_text(t(
+                    "Beispiele: 10.12.2025 – 11.12.2025 (ganze Tage) oder 10:00 – 11:00 (heute)",
+                ))
+                .clicked()
+            {
+                apply = true;
+            }
+            let midnight = days_from_civil(today.0, today.1, today.2) * 86_400 - offset;
+            let mut quick: Option<(u64, u64)> = None;
+            if ui.button(t("Heute")).clicked() {
+                quick = Some((midnight.max(0) as u64, now));
+            }
+            if ui.button(t("Gestern")).clicked() {
+                quick = Some(((midnight - 86_400).max(0) as u64, midnight.max(0) as u64));
+            }
+            if ui
+                .add_enabled(self.custom.is_some(), egui::Button::new(t("Zurücksetzen")))
+                .clicked()
+            {
+                self.custom = None;
+                self.custom_error = None;
+                self.custom_from.clear();
+                self.custom_to.clear();
+            }
+            if let Some((from, to)) = quick {
+                self.custom_from = format_full(from);
+                self.custom_to = format_full(to);
+                apply = true;
+            }
+            if apply {
+                let from = parse_moment(
+                    &self.custom_from,
+                    (today.0, today.1, today.2),
+                    offset,
+                    false,
+                );
+                let to = if self.custom_to.trim().is_empty() {
+                    Some(now)
+                } else {
+                    parse_moment(&self.custom_to, (today.0, today.1, today.2), offset, true)
+                };
+                self.custom_error = None;
+                match (from, to) {
+                    (Some(from), Some(to)) if to <= from => {
+                        self.custom_error =
+                            Some("Das Ende muss nach dem Anfang liegen.".to_owned());
+                    }
+                    (Some(from), _) if from >= now => {
+                        self.custom_error = Some("Der Anfang liegt in der Zukunft.".to_owned());
+                    }
+                    (Some(from), Some(to)) => {
+                        self.custom = Some((from, to.min(now)));
+                        self.history_offset = 0;
+                    }
+                    _ => {
+                        self.custom_error = Some(
+                            "Datum nicht verstanden. Beispiele: 10.12.2025, 10.12.2025 14:30, 10:00"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        });
+        if let Some(error) = &self.custom_error {
+            ui.label(RichText::new(t(error)).size(12.5).color(p.danger));
+        }
+
+        fit_charts(
+            ui,
+            chart_count(self.history_device, &samples),
+            timeline_height + 150.0,
+        );
+        device_charts(ui, &p, self.history_device, &samples, range, end);
 
         // ── Zeitleiste: größerer Zeitraum, das gezeigte Fenster lässt sich verschieben ──
         theme::card(&p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let step = (range.seconds() / 2).max(1);
+                let step = (window / 2).max(1);
                 if ui.button("◀").on_hover_text(t("Früher")).clicked() {
-                    self.history_offset += step;
+                    match self.custom {
+                        Some((from, to)) => {
+                            self.custom =
+                                Some((from.saturating_sub(step), to.saturating_sub(step)));
+                        }
+                        None => self.history_offset += step,
+                    }
                 }
+                let can_forward =
+                    self.history_offset > 0 || self.custom.is_some_and(|(_, to)| to < now);
                 if ui
-                    .add_enabled(self.history_offset > 0, egui::Button::new("▶"))
+                    .add_enabled(can_forward, egui::Button::new("▶"))
                     .on_hover_text(t("Später"))
                     .clicked()
                 {
-                    self.history_offset = self.history_offset.saturating_sub(step);
+                    match self.custom {
+                        Some((from, to)) => {
+                            let to = (to + step).min(now);
+                            self.custom = Some((to.saturating_sub(window), to));
+                            let _ = from;
+                        }
+                        None => self.history_offset = self.history_offset.saturating_sub(step),
+                    }
                 }
                 if ui
-                    .add_enabled(self.history_offset > 0, egui::Button::new(t("Jetzt")))
+                    .add_enabled(can_forward, egui::Button::new(t("Jetzt")))
                     .clicked()
                 {
                     self.history_offset = 0;
+                    if self.custom.is_some() {
+                        self.custom = Some((now.saturating_sub(window), now));
+                    }
                 }
-                let with_date = span > 86_400;
-                let window = if self.history_offset == 0 {
+                let with_date = span > 86_400 || window > 86_400;
+                let text = if self.history_offset == 0 && self.custom.is_none() {
                     crate::i18n::td(format!("Live · letzte {}", range.label()))
                 } else {
                     format!(
@@ -1705,28 +2034,55 @@ impl MonitorView {
                         format_clock(end, with_date)
                     )
                 };
-                ui.label(theme::secondary(&p, window).size(12.5));
+                ui.label(theme::secondary(&p, text).size(12.5));
             });
 
-            let size = egui::vec2(ui.available_width(), TIMELINE_HEIGHT);
+            let size = egui::vec2(ui.available_width(), timeline_height);
             let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, p.radius, p.field_bg);
-            let plot = rect.shrink2(egui::vec2(6.0, 4.0));
+            let mut plot = rect.shrink2(egui::vec2(6.0, 4.0));
+            plot.max.y -= 14.0;
             let first = now.saturating_sub(span);
-            let x_of = |time: u64| {
+            let x_of = |time: f64| {
                 plot.left()
-                    + (time.saturating_sub(first) as f32 / span as f32).clamp(0.0, 1.0)
-                        * plot.width()
+                    + (((time - first as f64) / span as f64) as f32).clamp(0.0, 1.0) * plot.width()
             };
+
+            // Zeitmarken mit Datum und Uhrzeit.
+            let offset = platform::local_offset_secs();
+            let steps = [
+                60u64, 300, 600, 900, 1800, 3600, 7200, 10_800, 21_600, 43_200, 86_400, 172_800,
+                604_800,
+            ];
+            let tick_step = steps
+                .iter()
+                .copied()
+                .find(|step| plot.width() * *step as f32 / span as f32 >= 120.0)
+                .unwrap_or(604_800) as i64;
+            let tick_font = FontId::proportional(10.5);
+            let mut tick = ((first as i64 + offset).div_euclid(tick_step) + 1) * tick_step - offset;
+            let grid = Stroke::new(1.0_f32, p.text_secondary.gamma_multiply(0.18));
+            while tick <= now as i64 {
+                let x = x_of(tick as f64);
+                painter.vline(x, plot.y_range(), grid);
+                painter.text(
+                    Pos2::new(x, rect.bottom() - 1.0),
+                    Align2::CENTER_BOTTOM,
+                    format_clock(tick as u64, span > 86_400 || tick_step >= 86_400),
+                    tick_font.clone(),
+                    p.text_secondary,
+                );
+                tick += tick_step;
+            }
 
             // Verlauf der gewählten Komponente über den ganzen Zeitraum.
             let net_max = headroom(&overview, |s| (s.net_down + s.net_up) / BYTES_PER_MB, 0.5);
             let value = device_load(self.history_device, net_max);
             let color = device_color(&p, self.history_device);
-            let max_gap = (span / 60).max(if span > 3600 { 180 } else { 25 });
+            let max_gap = gap_limit(&overview).max(span as f64 / 60.0);
             let mut segment: Vec<Pos2> = Vec::new();
-            let mut previous = 0u64;
+            let mut previous = 0.0f64;
             let flush = |segment: &mut Vec<Pos2>| {
                 if segment.len() > 1 {
                     fill_below(&painter, segment, plot.bottom(), color.gamma_multiply(0.18));
@@ -1743,55 +2099,48 @@ impl MonitorView {
                     flush(&mut segment);
                     continue;
                 };
-                if !segment.is_empty() && sample.time.saturating_sub(previous) > max_gap {
+                if !segment.is_empty() && sample.secs() - previous > max_gap {
                     flush(&mut segment);
                 }
                 let y = plot.bottom() - (load / 100.0).clamp(0.0, 1.0) * plot.height();
-                segment.push(Pos2::new(x_of(sample.time), y));
-                previous = sample.time;
+                segment.push(Pos2::new(x_of(sample.secs()), y));
+                previous = sample.secs();
             }
             flush(&mut segment);
 
             // Gezeigtes Fenster hervorheben.
             let selection = Rect::from_min_max(
-                Pos2::new(x_of(start), rect.top() + 1.0),
-                Pos2::new(x_of(end).max(x_of(start) + 4.0), rect.bottom() - 1.0),
+                Pos2::new(x_of(start as f64), rect.top() + 1.0),
+                Pos2::new(
+                    x_of(end as f64).max(x_of(start as f64) + 4.0),
+                    rect.bottom() - 1.0,
+                ),
             );
             painter.rect_filled(selection, 3.0, p.accent.gamma_multiply(0.14));
             painter.rect_stroke(selection, 3.0, Stroke::new(1.5_f32, p.accent));
-
-            let font = FontId::proportional(10.5);
-            painter.text(
-                Pos2::new(plot.left(), rect.bottom() - 1.0),
-                Align2::LEFT_BOTTOM,
-                format_clock(first, span > 86_400),
-                font.clone(),
-                p.text_secondary,
-            );
-            painter.text(
-                Pos2::new(plot.right(), rect.bottom() - 1.0),
-                Align2::RIGHT_BOTTOM,
-                format_clock(now, span > 86_400),
-                font,
-                p.text_secondary,
-            );
 
             // Klicken oder Ziehen setzt die Mitte des Fensters auf den Mauszeiger.
             let pointer = response.interact_pointer_pos();
             if let Some(pointer) = pointer.filter(|_| response.clicked() || response.dragged()) {
                 let share = ((pointer.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
                 let center = first + (share as f64 * span as f64) as u64;
-                let wanted_end = (center + range.seconds() / 2).min(now);
-                let offset = now - wanted_end;
-                // Nahe am rechten Rand rastet das Fenster wieder auf „live“ ein.
-                self.history_offset = if offset < range.seconds() / 20 {
-                    0
+                if self.custom.is_some() {
+                    let to = (center + window / 2).min(now);
+                    self.custom = Some((to.saturating_sub(window), to));
                 } else {
-                    offset
-                };
+                    let wanted_end = (center + window / 2).min(now);
+                    let offset = now - wanted_end;
+                    // Nahe am rechten Rand rastet das Fenster wieder auf „live“ ein.
+                    self.history_offset = if offset < window / 20 { 0 } else { offset };
+                }
             }
             if response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if let Some(hover) = response.hover_pos() {
+                let share = ((hover.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+                let time = first + (share as f64 * span as f64) as u64;
+                response.on_hover_text(format_full(time));
             }
         });
 
@@ -1799,8 +2148,9 @@ impl MonitorView {
             theme::secondary(
                 &p,
                 "Zeige mit der Maus auf einen Zeitpunkt, um zu sehen, welches Programm dort die meiste Last erzeugte. \
-                 In der Zeitleiste verschiebst du das Fenster per Klick oder Ziehen. Aufgezeichnet wird auch, \
-                 während Toolless im Tray läuft; 7 Tage bleiben gespeichert.",
+                 In der Zeitleiste verschiebst du das Fenster per Klick oder Ziehen. Mit „Von“ und „bis“ wählst du \
+                 einen beliebigen Zeitraum, zum Beispiel 10.12.2025 bis 11.12.2025 oder heute 10:00 bis 11:00. \
+                 Aufgezeichnet wird auch, während Toolless im Tray läuft.",
             )
             .size(12.0),
         );
@@ -1832,178 +2182,39 @@ impl MonitorView {
                 }
             }
         });
+        ui.add_space(4.0);
 
-        // Obere Hälfte: Liste der Volumes.
-        theme::card(&p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            if volumes.is_empty() {
-                ui.label(theme::secondary(&p, t("Datenträger werden gelesen …")));
-                return;
-            }
-            egui::Grid::new("monitor-volumes")
-                .num_columns(8)
-                .striped(true)
-                .spacing(egui::vec2(22.0, 6.0))
-                .show(ui, |ui| {
-                    for title in [
-                        "Volume",
-                        "Name",
-                        "Dateisystem",
-                        "Typ",
-                        "Kapazität",
-                        "Frei",
-                        "% frei",
-                        "",
-                    ] {
-                        ui.label(theme::secondary(&p, title).size(12.5));
-                    }
-                    ui.end_row();
-                    for volume in &volumes {
-                        let free_share = if volume.total > 0 {
-                            volume.free as f32 / volume.total as f32 * 100.0
-                        } else {
-                            0.0
-                        };
-                        ui.label(RichText::new(volume.mount.trim_end_matches('\\')).strong());
-                        ui.label(volume.name.as_str());
-                        ui.label(volume.file_system.as_str());
-                        let kind = if volume.removable {
-                            "Wechseldatenträger"
-                        } else {
-                            volume.kind.as_str()
-                        };
-                        ui.label(if kind == "Unknown" { "–" } else { kind });
-                        ui.label(format_bytes(volume.total));
-                        ui.label(format_bytes(volume.free));
-                        // Fast volle Laufwerke fallen farblich auf.
-                        let share = RichText::new(format!("{free_share:.0} %"));
-                        ui.label(if free_share < 10.0 {
-                            share.color(p.danger)
-                        } else {
-                            share
-                        });
-                        if ui.small_button(t("Öffnen")).clicked() {
-                            error = platform::open_folder(Path::new(&volume.mount)).err();
-                        }
-                        ui.end_row();
-                    }
-                });
-        });
-
-        // Untere Hälfte: physische Datenträger mit ihrer Partitionsaufteilung.
-        for disk in &physical {
-            theme::card(&p).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 3.0;
-                    ui.vertical(|ui| {
-                        ui.set_width(170.0);
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(
-                            RichText::new(crate::i18n::td(format!("Datenträger {}", disk.number)))
-                                .strong(),
-                        );
-                        if !disk.model.is_empty() {
-                            ui.label(theme::secondary(&p, disk.model.as_str()).size(12.0));
-                        }
-                        let mut facts = vec![format_bytes(disk.size), disk.style.clone()];
-                        if !disk.bus.is_empty() {
-                            facts.push(disk.bus.clone());
-                        }
-                        if disk.removable {
-                            facts.push(t("Wechselmedium").to_owned());
-                        }
-                        ui.label(theme::secondary(&p, facts.join(" · ")).size(12.0));
-                    });
-
-                    // Partitionen proportional zu ihrer Größe, aber nie schmaler als lesbar.
-                    let count = disk.partitions.len().max(1) as f32;
-                    let available = ui.available_width() - 3.0 * count;
-                    let minimum = 86.0f32.min(available / count).max(8.0);
-                    let flexible = (available - minimum * count).max(0.0);
-                    for partition in &disk.partitions {
-                        let share = partition.size as f32 / disk.size.max(1) as f32;
-                        let width = minimum + flexible * share;
-                        let (rect, response) =
-                            ui.allocate_exact_size(egui::vec2(width, 78.0), Sense::hover());
-                        let volume = volumes.iter().find(|volume| {
-                            !partition.letter.is_empty()
-                                && volume.mount.starts_with(&partition.letter)
-                        });
-
-                        // Farbstreifen oben: belegte Partition in Akzentfarbe, freier Bereich dunkel.
-                        let strip_color = if partition.unallocated {
-                            p.text_secondary
-                        } else {
-                            p.accent
-                        };
-                        ui.painter().rect_filled(rect, 2.0, p.field_bg);
-                        let strip = Rect::from_min_size(rect.min, egui::vec2(rect.width(), 7.0));
-                        ui.painter().rect_filled(strip, 2.0, strip_color);
-                        ui.painter()
-                            .rect_stroke(rect, 2.0, Stroke::new(1.0_f32, p.separator));
-
-                        let headline = if partition.unallocated {
-                            "Nicht zugeordnet".to_owned()
-                        } else if let Some(volume) = volume {
-                            format!("{} {}", partition.letter, volume.name)
-                                .trim()
-                                .to_owned()
-                        } else {
-                            partition.kind.clone()
-                        };
-                        let detail_line = match volume {
-                            Some(volume) => crate::i18n::td(format!(
-                                "{} · {} frei",
-                                volume.file_system,
-                                format_bytes(volume.free)
-                            )),
-                            None if partition.unallocated => String::new(),
-                            None => "ohne Laufwerksbuchstabe".to_owned(),
-                        };
-                        let clipped = ui.painter().with_clip_rect(rect.shrink(4.0));
-                        let left = rect.left() + 7.0;
-                        clipped.text(
-                            Pos2::new(left, rect.top() + 12.0),
-                            Align2::LEFT_TOP,
-                            &headline,
-                            FontId::proportional(13.0),
-                            p.text,
-                        );
-                        clipped.text(
-                            Pos2::new(left, rect.top() + 31.0),
-                            Align2::LEFT_TOP,
-                            format_bytes(partition.size),
-                            FontId::proportional(12.0),
-                            p.text_secondary,
-                        );
-                        clipped.text(
-                            Pos2::new(left, rect.top() + 49.0),
-                            Align2::LEFT_TOP,
-                            &detail_line,
-                            FontId::proportional(12.0),
-                            p.text_secondary,
-                        );
-                        response.on_hover_text(format!(
-                            "{headline}\n{}\n{}\n{detail_line}",
-                            partition.kind,
-                            format_bytes(partition.size)
-                        ));
-                    }
-                });
-            });
-        }
-        if physical.is_empty() && cfg!(windows) {
+        if physical.is_empty() {
             ui.label(theme::secondary(
                 &p,
-                t("Der Aufbau der physischen Datenträger wird gelesen …"),
+                t(if cfg!(windows) {
+                    "Der Aufbau der physischen Datenträger wird gelesen …"
+                } else {
+                    "Datenträger werden gelesen …"
+                }),
             ));
         }
+
+        // Datenträger als Kästen, nebeneinander und nach unten fortlaufend – je nach Breite.
+        let columns = ((ui.available_width() / 340.0).floor() as usize).clamp(1, 4);
+        let mut open: Option<u32> = None;
+        ui.columns(columns, |cols| {
+            for (index, disk) in physical.iter().enumerate() {
+                if disk_card(&mut cols[index % columns], &p, disk, &volumes) {
+                    open = Some(disk.number);
+                }
+            }
+        });
+        if let Some(number) = open {
+            self.disk_popup = Some((number, smart::read(number)));
+        }
+        self.disk_window(ui.ctx(), &p, &physical, &volumes);
+
+        ui.add_space(6.0);
         ui.label(
             theme::secondary(
                 &p,
-                t("Diese Ansicht ist nur lesend. Partitionen ändern, formatieren oder Laufwerksbuchstaben \
-                 vergeben geht bewusst nur in der Windows-Datenträgerverwaltung."),
+                t("Klick auf einen Datenträger zeigt Details und Gesundheitswerte (SMART). Partitionen ändern, formatieren oder Laufwerksbuchstaben vergeben geht bewusst nur in der Windows-Datenträgerverwaltung."),
             )
             .size(12.0),
         );
@@ -2013,360 +2224,356 @@ impl MonitorView {
         }
     }
 
-    // ───────── Energie (angelehnt an WattSeal) ─────────
-
-    fn energy(&mut self, ui: &mut Ui, shared: &mut Shared) {
-        let p = shared.palette;
-        let now = unix_now();
-        let range = self.range;
-        let (samples, power, mut rows): (Vec<Sample>, PowerBreakdown, Vec<ProcessRow>) =
-            shared.monitor.read(|state| {
-                (
-                    collect_samples(state, range, now),
-                    state.power.clone(),
-                    state.processes.clone(),
-                )
-            });
-        let last = samples.last().cloned().unwrap_or_default();
-        let (first, second, third) = series_colors(&p);
-        rows.sort_by(|a, b| b.power_w.total_cmp(&a.power_w));
-        if self.energy_rows == 0 {
-            self.energy_rows = 10;
+    /// Fenster mit den Details eines Datenträgers, wie CrystalDiskInfo.
+    fn disk_window(
+        &mut self,
+        ctx: &egui::Context,
+        p: &Palette,
+        physical: &[PhysicalDisk],
+        volumes: &[DiskRow],
+    ) {
+        let Some((number, info)) = self.disk_popup.clone() else {
+            return;
+        };
+        let disk = physical.iter().find(|disk| disk.number == number);
+        let (mut used, mut free) = (0u64, 0u64);
+        let mut letters: Vec<String> = Vec::new();
+        for partition in disk.map(|disk| disk.partitions.as_slice()).unwrap_or(&[]) {
+            if let Some(volume) = volume_of(volumes, &partition.letter) {
+                used += volume.total.saturating_sub(volume.free);
+                free += volume.free;
+                letters.push(partition.letter.clone());
+            }
         }
-        rows.truncate(self.energy_rows);
-        self.request_icons(ui, rows.iter());
+        let model = if info.model.is_empty() {
+            disk.map(|disk| disk.model.clone()).unwrap_or_default()
+        } else {
+            info.model.clone()
+        };
+        let (mut close, mut refresh) = (false, false);
+        let amber = Color32::from_rgb(230, 160, 0);
 
-        // Kopf: aktuelle Leistung, Gesamtenergie mit Emissionen, geschätzte Kosten.
-        let currency = shared.settings.power_currency.clone();
-        let total_kwh = power.total_wh / 1000.0;
-        let emissions = total_kwh * shared.settings.power_co2_g_kwh as f64;
-        let cost = total_kwh * shared.settings.power_price_kwh as f64;
-        theme::card(&p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.columns(3, |columns| {
-                columns[0].vertical_centered(|ui| {
-                    ui.label(theme::secondary(&p, t("Aktuelle Leistungsaufnahme")));
-                    ui.label(
-                        RichText::new(format!("{:.1} W", power.total_w).replace('.', ","))
-                            .size(32.0)
-                            .color(p.accent),
-                    );
-                    let quality = match (power.cpu_measured, power.gpu_measured) {
-                        (true, true) => "Prozessor und Grafikkarte gemessen",
-                        (true, false) => "Prozessor gemessen, Grafikkarte geschätzt",
-                        (false, true) => "Grafikkarte gemessen, Prozessor geschätzt",
-                        (false, false) => "geschätzt",
-                    };
-                    ui.label(theme::secondary(&p, quality).size(12.0));
-                    // Aufschlüsselung – so lässt sich jeder Anteil einzeln nachvollziehen.
-                    let mut parts = vec![
-                        format!("CPU {:.1} W", power.cpu_w),
-                        format!("GPU {:.1} W", power.gpu_w),
-                        format!("RAM {:.1} W", power.ram_w),
-                    ];
-                    if power.base_w > 0.0 {
-                        parts.push(crate::i18n::td(format!("Grundlast {:.0} W", power.base_w)));
-                    }
-                    ui.label(theme::secondary(&p, parts.join(" + ").replace('.', ",")).size(12.0));
-                });
-                columns[1].vertical_centered(|ui| {
-                    ui.label(theme::secondary(&p, t("Gesamt")));
-                    ui.label(
-                        RichText::new(format!("{total_kwh:.2} kWh").replace('.', ","))
-                            .size(18.0)
-                            .color(third),
-                    );
-                    ui.label(theme::secondary(&p, t("Emissionen")));
-                    ui.label(
-                        RichText::new(format!("{emissions:.1} g CO₂").replace('.', ","))
-                            .size(18.0)
-                            .color(second),
-                    );
-                });
-                columns[2].vertical_centered(|ui| {
-                    ui.label(theme::secondary(&p, t("Geschätzte Kosten")));
-                    ui.label(
-                        RichText::new(format!("{cost:.2} {currency}").replace('.', ","))
-                            .size(18.0)
-                            .color(p.accent),
-                    );
-                    ui.label(
-                        theme::secondary(
-                            &p,
-                            crate::i18n::td(format!("{:.1} Wh seit dem Start", power.session_wh))
-                                .replace('.', ","),
-                        )
-                        .size(12.0),
-                    );
-                });
-            });
-        });
+        egui::Window::new(crate::i18n::td(format!("Datenträger {number}")))
+            .id(egui::Id::new(("disk-window", number)))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_width(660.0);
+                let size = disk.map_or(0, |disk| disk.size);
+                ui.label(
+                    RichText::new(format!("{model} : {}", format_bytes(size)))
+                        .size(20.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
 
-        self.range_chips(ui, &p);
-
-        theme::card(&p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::card_title(ui, t("Gesamt"));
-            let max = (headroom(&samples, |s| s.power_w, 50.0) / 50.0).ceil() * 50.0;
-            let lines = [Line {
-                label: "Leistung",
-                color: first,
-                value: &|s| Some(s.power_w),
-            }];
-            chart(ui, &p, &samples, &lines, max, "W", range, now);
-        });
-
-        // Programme nach geschätztem Verbrauch.
-        theme::card(&p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                theme::card_title(ui, t("Prozesse"));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    for count in [25usize, 10, 5] {
-                        if theme::chip(
-                            ui,
-                            &p,
-                            &crate::i18n::td(format!("Top {count}")),
-                            self.energy_rows == count,
-                        )
-                        .clicked()
-                        {
-                            self.energy_rows = count;
-                        }
-                    }
-                });
-            });
-            egui::Grid::new("monitor-energy-processes")
-                .num_columns(6)
-                .striped(true)
-                .spacing(egui::vec2(26.0, 6.0))
-                .show(ui, |ui| {
-                    for title in ["Anwendung", "Leistung", "CPU", "RAM", "Lesen", "Schreiben"] {
-                        ui.label(theme::secondary(&p, title).size(12.5));
-                    }
-                    ui.end_row();
-                    for row in &rows {
-                        ui.horizontal(|ui| {
-                            theme::app_icon(
-                                ui,
-                                &p,
-                                self.icon_of(row),
-                                display_name(&row.name),
-                                16.0,
+                ui.horizontal_top(|ui| {
+                    // Links: Gesamtzustand und Temperatur als große Felder.
+                    ui.vertical(|ui| {
+                        let status_color = match info.status {
+                            Status::Good => p.accent,
+                            Status::Caution => amber,
+                            Status::Bad => p.danger,
+                            Status::Unknown => p.text_secondary,
+                        };
+                        let big = |ui: &mut Ui, title: &str, value: String, color: Color32| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(130.0, 70.0), Sense::hover());
+                            ui.painter()
+                                .rect_filled(rect, p.radius, color.gamma_multiply(0.25));
+                            ui.painter()
+                                .rect_stroke(rect, p.radius, Stroke::new(1.5_f32, color));
+                            ui.painter().text(
+                                egui::pos2(rect.center().x, rect.top() + 6.0),
+                                Align2::CENTER_TOP,
+                                title,
+                                FontId::proportional(11.5),
+                                p.text_secondary,
                             );
-                            let name = format!("{} ({})", display_name(&row.name), row.pids.len());
-                            ui.label(RichText::new(name).color(p.accent));
-                        });
-                        ui.label(
-                            RichText::new(format!("{:.1} W", row.power_w).replace('.', ","))
-                                .strong(),
-                        );
-                        ui.label(format_percent(row.cpu));
-                        ui.label(format_bytes(row.memory));
-                        ui.label(format_rate(row.disk_read));
-                        ui.label(format_rate(row.disk_write));
-                        ui.end_row();
-                    }
-                });
-        });
-
-        // Komponenten in zwei Spalten.
-        let disk_max = headroom(
-            &samples,
-            |s| s.disk_read.max(s.disk_write) / BYTES_PER_MB,
-            1.0,
-        );
-        let net_max = headroom(&samples, |s| s.net_down.max(s.net_up) / BYTES_PER_MB, 0.5);
-        let watt_max =
-            |value: fn(&Sample) -> f32| (headroom(&samples, value, 10.0) / 10.0).ceil() * 10.0;
-        let (cpu_max, gpu_max, ram_max) = (
-            watt_max(|s| s.cpu_w),
-            watt_max(|s| s.gpu_w),
-            watt_max(|s| s.ram_w),
-        );
-        ui.columns(2, |columns| {
-            theme::card(&p).show(&mut columns[0], |ui| {
-                ui.set_width(ui.available_width());
-                theme::card_title(ui, "CPU");
-                ui.label(theme::secondary(
-                    &p,
-                    crate::i18n::td(format!(
-                        "Leistung: {:.1} W ({}) · Auslastung: {:.1} %",
-                        power.cpu_w,
-                        measured_label(power.cpu_measured),
-                        last.cpu
-                    ))
-                    .replace('.', ","),
-                ));
-                let lines = [Line {
-                    label: "Leistung",
-                    color: first,
-                    value: &|s| Some(s.cpu_w),
-                }];
-                chart(ui, &p, &samples, &lines, cpu_max, "W", range, now);
-            });
-            theme::card(&p).show(&mut columns[1], |ui| {
-                ui.set_width(ui.available_width());
-                theme::card_title(ui, "GPU");
-                let source = measured_label(power.gpu_measured);
-                let usage = last.gpu.map_or("–".to_owned(), |u| format!("{u:.1} %"));
-                ui.label(theme::secondary(
-                    &p,
-                    crate::i18n::td(format!(
-                        "Leistung: {:.1} W ({source}) · Auslastung: {usage}",
-                        power.gpu_w
-                    ))
-                    .replace('.', ","),
-                ));
-                let lines = [Line {
-                    label: "Leistung",
-                    color: first,
-                    value: &|s| Some(s.gpu_w),
-                }];
-                chart(ui, &p, &samples, &lines, gpu_max, "W", range, now);
-            });
-            theme::card(&p).show(&mut columns[0], |ui| {
-                ui.set_width(ui.available_width());
-                theme::card_title(ui, "RAM");
-                ui.label(theme::secondary(
-                    &p,
-                    crate::i18n::td(format!(
-                        "Leistung: {:.1} W (geschätzt) · Belegt: {:.1} %",
-                        power.ram_w, last.ram
-                    ))
-                    .replace('.', ","),
-                ));
-                let lines = [Line {
-                    label: "Leistung",
-                    color: third,
-                    value: &|s| Some(s.ram_w),
-                }];
-                chart(ui, &p, &samples, &lines, ram_max, "W", range, now);
-            });
-            theme::card(&p).show(&mut columns[1], |ui| {
-                ui.set_width(ui.available_width());
-                theme::card_title(ui, t("Datenträger"));
-                ui.label(theme::secondary(
-                    &p,
-                    crate::i18n::td(format!(
-                        "Lesen: {} · Schreiben: {}",
-                        format_rate(last.disk_read),
-                        format_rate(last.disk_write)
-                    )),
-                ));
-                let lines = [
-                    Line {
-                        label: "Lesen",
-                        color: third,
-                        value: &|s| Some(s.disk_read / BYTES_PER_MB),
-                    },
-                    Line {
-                        label: "Schreiben",
-                        color: second,
-                        value: &|s| Some(s.disk_write / BYTES_PER_MB),
-                    },
-                ];
-                chart(ui, &p, &samples, &lines, disk_max, "MB/s", range, now);
-            });
-            theme::card(&p).show(&mut columns[0], |ui| {
-                ui.set_width(ui.available_width());
-                theme::card_title(ui, t("Netzwerk"));
-                ui.label(theme::secondary(
-                    &p,
-                    crate::i18n::td(format!(
-                        "Empfangen: {} · Gesendet: {}",
-                        format_rate(last.net_down),
-                        format_rate(last.net_up)
-                    )),
-                ));
-                let lines = [
-                    Line {
-                        label: "Empfangen",
-                        color: third,
-                        value: &|s| Some(s.net_down / BYTES_PER_MB),
-                    },
-                    Line {
-                        label: "Gesendet",
-                        color: second,
-                        value: &|s| Some(s.net_up / BYTES_PER_MB),
-                    },
-                ];
-                chart(ui, &p, &samples, &lines, net_max, "MB/s", range, now);
-            });
-        });
-
-        // Annahmen der Schätzung.
-        let mut changed = false;
-        theme::card(&p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::card_title(ui, t("Annahmen"));
-            let source = |measured: bool, how: &str, missing: &str| {
-                if measured {
-                    crate::i18n::td(format!("gemessen ({how})"))
-                } else {
-                    crate::i18n::td(format!("geschätzt – {missing}"))
-                }
-            };
-            ui.label(crate::i18n::td(format!(
-                "Prozessor: {}",
-                source(
-                    power.cpu_measured,
-                    t("Energiezähler von Windows"),
-                    t("dieses System bietet Windows keinen Energiezähler an")
-                )
-            )));
-            ui.label(crate::i18n::td(format!(
-                "Grafikkarte: {}",
-                source(
-                    power.gpu_measured,
-                    t("Sensor des Grafiktreibers"),
-                    t("der Treiber meldet keine Leistung")
-                )
-            )));
-            ui.label(
-                theme::secondary(
-                    &p,
-                    "Gemessene Werte kommen direkt aus den Sensoren von Prozessor und Grafikkarte. Was kein \
-                     Sensor erfasst, wird geschätzt: Arbeitsspeicher, Mainboard, Laufwerke, Lüfter und die \
-                     Verluste des Netzteils (Grundlast). Die Maximalleistungen unten gelten nur für geschätzte \
-                     Komponenten. Den Verbrauch an der Steckdose kann nur ein Messgerät zeigen.",
-                )
-                .size(12.5),
-            );
-            let settings = &mut shared.settings;
-            let mut field = |ui: &mut Ui, label: &str, value: &mut f32, max: f32, speed: f64, suffix: &str| {
-                ui.horizontal(|ui| {
-                    ui.label(label);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let drag = egui::DragValue::new(value).range(0.0..=max).speed(speed).suffix(suffix);
-                        // Erst speichern, wenn die Eingabe abgeschlossen ist.
-                        let response = ui.add(drag);
-                        if response.drag_stopped() || response.lost_focus() {
-                            changed = true;
-                        }
+                            ui.painter().text(
+                                egui::pos2(rect.center().x, rect.bottom() - 8.0),
+                                Align2::CENTER_BOTTOM,
+                                value,
+                                FontId::proportional(22.0),
+                                p.text,
+                            );
+                        };
+                        let status = match info.health_percent {
+                            Some(percent) => format!("{} {percent} %", t(info.status.label())),
+                            None => t(info.status.label()).to_owned(),
+                        };
+                        big(ui, t("Gesamtzustand"), status, status_color);
+                        ui.add_space(6.0);
+                        let temperature = info
+                            .temperature
+                            .map_or("–".to_owned(), |degrees| format!("{degrees:.0} °C"));
+                        let temperature_color = match info.temperature {
+                            Some(degrees) if degrees >= 65.0 => p.danger,
+                            Some(degrees) if degrees >= 50.0 => amber,
+                            Some(_) => p.accent,
+                            None => p.text_secondary,
+                        };
+                        big(ui, t("Temperatur"), temperature, temperature_color);
                     });
+
+                    // Rechts: Kennzahlen in vier Spalten.
+                    let number_text = |value: Option<u64>, unit: &str| {
+                        value.map_or("–".to_owned(), |value| format!("{value}{unit}"))
+                    };
+                    let bytes_text =
+                        |value: Option<u64>| value.map_or("–".to_owned(), format_bytes);
+                    let hours = info.power_on_hours.map_or("–".to_owned(), |hours| {
+                        format!("{hours} h ({} d)", hours / 24)
+                    });
+                    let rows: [(&str, String, &str, String); 7] = [
+                        (
+                            "Firmware",
+                            or_dash(&info.firmware),
+                            "Gesamt gelesen",
+                            bytes_text(info.total_read),
+                        ),
+                        (
+                            "Seriennummer",
+                            or_dash(&info.serial),
+                            "Gesamt geschrieben",
+                            bytes_text(info.total_written),
+                        ),
+                        (
+                            "Schnittstelle",
+                            or_dash(if info.interface.is_empty() {
+                                disk.map_or("", |disk| disk.bus.as_str())
+                            } else {
+                                info.interface.as_str()
+                            }),
+                            "Eingeschaltet",
+                            number_text(info.power_cycles, "×"),
+                        ),
+                        (
+                            "Laufwerke",
+                            or_dash(&letters.join(" ")),
+                            "Betriebsstunden",
+                            hours,
+                        ),
+                        (
+                            "Belegt",
+                            if used + free > 0 {
+                                format_bytes(used)
+                            } else {
+                                "–".to_owned()
+                            },
+                            "Unsichere Abschaltungen",
+                            number_text(info.unsafe_shutdowns, ""),
+                        ),
+                        (
+                            "Frei",
+                            if used + free > 0 {
+                                format_bytes(free)
+                            } else {
+                                "–".to_owned()
+                            },
+                            "Fehler (Medium)",
+                            number_text(info.errors, ""),
+                        ),
+                        (
+                            "Partitionen",
+                            disk.map_or("–".to_owned(), |disk| disk.partitions.len().to_string()),
+                            "Fehlerprotokoll-Einträge",
+                            number_text(info.error_log_entries, ""),
+                        ),
+                    ];
+                    egui::Grid::new("disk-facts")
+                        .num_columns(4)
+                        .spacing(egui::vec2(14.0, 7.0))
+                        .show(ui, |ui| {
+                            for (left, left_value, right, right_value) in rows {
+                                ui.label(theme::secondary(p, t(left)).size(12.5));
+                                ui.label(RichText::new(left_value).strong());
+                                ui.label(theme::secondary(p, t(right)).size(12.5));
+                                ui.label(RichText::new(right_value).strong());
+                                ui.end_row();
+                            }
+                        });
                 });
-            };
-            field(ui, t("Maximalleistung Prozessor (TDP)"), &mut settings.power_cpu_max_w, 1000.0, 1.0, " W");
-            field(ui, t("Maximalleistung Grafikkarte"), &mut settings.power_gpu_max_w, 1500.0, 1.0, " W");
-            field(ui, t("Zusätzliche Grundlast (Mainboard, Lüfter, Netzteil)"), &mut settings.power_extra_base_w, 500.0, 1.0, " W");
-            field(ui, t("Strompreis je kWh"), &mut settings.power_price_kwh, 5.0, 0.01, "");
-            field(ui, t("CO₂ je kWh"), &mut settings.power_co2_g_kwh, 2000.0, 1.0, " g");
-            ui.horizontal(|ui| {
-                ui.label(t("Währung"));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let response = ui.add(TextEdit::singleline(&mut settings.power_currency).desired_width(60.0));
-                    if response.lost_focus() {
-                        changed = true;
+
+                ui.add_space(8.0);
+                if info.rows.is_empty() {
+                    if let Some(note) = &info.note {
+                        ui.label(theme::secondary(p, t(note)).size(12.5));
+                    }
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("disk-smart-rows")
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("disk-smart")
+                                .num_columns(3)
+                                .striped(true)
+                                .spacing(egui::vec2(20.0, 4.0))
+                                .min_col_width(40.0)
+                                .show(ui, |ui| {
+                                    for title in ["ID", "Attributname", "Rohwerte"] {
+                                        ui.label(theme::secondary(p, t(title)).size(12.0));
+                                    }
+                                    ui.end_row();
+                                    for (id, name, raw) in &info.rows {
+                                        ui.label(id.as_str());
+                                        ui.label(name.as_str());
+                                        ui.label(RichText::new(raw.as_str()).monospace());
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t("Aktualisieren")).clicked() {
+                        refresh = true;
+                    }
+                    if ui.button(t("Schließen")).clicked() {
+                        close = true;
                     }
                 });
             });
-        });
-        if changed {
-            shared.save_settings();
-            shared
-                .monitor
-                .send(Command::Config(shared.settings.power_config()));
+
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        if close {
+            self.disk_popup = None;
+        } else if refresh {
+            self.disk_popup = Some((number, smart::read(number)));
         }
     }
+}
+
+fn or_dash(text: &str) -> String {
+    if text.is_empty() {
+        "–".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Das Volume zu einem Laufwerksbuchstaben wie `C:`.
+fn volume_of<'a>(volumes: &'a [DiskRow], letter: &str) -> Option<&'a DiskRow> {
+    if letter.is_empty() {
+        return None;
+    }
+    volumes
+        .iter()
+        .find(|volume| volume.mount.starts_with(letter))
+}
+
+/// Kasten eines physischen Datenträgers: Name, Größe, Belegung je Laufwerk. Liefert `true`
+/// bei Klick.
+fn disk_card(ui: &mut Ui, p: &Palette, disk: &PhysicalDisk, volumes: &[DiskRow]) -> bool {
+    let inner = theme::card(p).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(crate::i18n::td(format!("Datenträger {}", disk.number)))
+                    .strong()
+                    .size(16.0),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let mut tags = vec![disk.bus.clone()];
+                if disk.removable {
+                    tags.push(t("Wechselmedium").to_owned());
+                }
+                tags.retain(|tag| !tag.is_empty());
+                ui.label(theme::secondary(p, tags.join(" · ")).size(12.0));
+            });
+        });
+        if !disk.model.is_empty() {
+            ui.label(theme::secondary(p, disk.model.as_str()).size(12.5));
+        }
+        ui.label(
+            theme::secondary(p, format!("{} · {}", format_bytes(disk.size), disk.style)).size(12.0),
+        );
+        ui.add_space(4.0);
+
+        // Gesamtbalken: Partitionen im Verhältnis ihrer Größe, belegter Teil in Akzentfarbe.
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), Sense::hover());
+        let total = disk.size.max(1) as f32;
+        let mut x = rect.left();
+        for partition in &disk.partitions {
+            let width = (rect.width() * partition.size as f32 / total)
+                .max(2.0)
+                .min(rect.right() - x);
+            if width <= 0.0 {
+                break;
+            }
+            let segment =
+                Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(width, rect.height()));
+            x += width;
+            let background = if partition.unallocated {
+                p.separator.gamma_multiply(0.5)
+            } else {
+                p.field_bg
+            };
+            ui.painter()
+                .rect_filled(segment.shrink2(egui::vec2(0.5, 0.0)), 2.0, background);
+            if let Some(volume) = volume_of(volumes, &partition.letter) {
+                let used = 1.0 - volume.free as f32 / volume.total.max(1) as f32;
+                let mut filled = segment.shrink2(egui::vec2(0.5, 0.0));
+                filled.set_width(filled.width() * used.clamp(0.0, 1.0));
+                let color = if used > 0.9 { p.danger } else { p.accent };
+                ui.painter().rect_filled(filled, 2.0, color);
+            } else if !partition.unallocated {
+                ui.painter().rect_filled(
+                    segment.shrink2(egui::vec2(0.5, 0.0)),
+                    2.0,
+                    p.text_secondary.gamma_multiply(0.5),
+                );
+            }
+        }
+        ui.add_space(4.0);
+
+        // Eine Zeile je Laufwerk.
+        let mut any = false;
+        for partition in &disk.partitions {
+            let Some(volume) = volume_of(volumes, &partition.letter) else {
+                continue;
+            };
+            any = true;
+            let used = volume.total.saturating_sub(volume.free);
+            let share = used as f32 / volume.total.max(1) as f32;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(partition.letter.as_str()).strong());
+                if !volume.name.is_empty() {
+                    ui.label(theme::secondary(p, volume.name.as_str()).size(12.5));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let text = crate::i18n::td(format!(
+                        "{} belegt · {} frei",
+                        format_bytes(used),
+                        format_bytes(volume.free)
+                    ));
+                    let label = theme::secondary(p, text).size(12.0);
+                    ui.label(if share > 0.9 {
+                        label.color(p.danger)
+                    } else {
+                        label
+                    });
+                });
+            });
+        }
+        if !any {
+            ui.label(theme::secondary(p, t("Kein Laufwerksbuchstabe zugewiesen")).size(12.0));
+        }
+    });
+    let rect = inner.response.rect;
+    let response = ui.interact(
+        rect,
+        ui.id().with(("disk-card", disk.number)),
+        Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter()
+            .rect_stroke(rect, p.card_radius, Stroke::new(1.5_f32, p.accent));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
 }

@@ -30,9 +30,19 @@ use crate::{
     theme::{self, Palette},
     tray::{self, Tray, TrayDeps},
     ui::{
-        calculator::CalculatorView, clipboard::ClipboardView, clock::ClockView, games::GamesView,
-        launcher::LauncherView, minecraft::MinecraftView, monitor::MonitorView, notes::NotesView,
-        spotify::SpotifyView, system::SystemView,
+        blackout::{Blackout, Mode as BlackoutMode},
+        calculator::CalculatorView,
+        clipboard::ClipboardView,
+        clock::ClockView,
+        games::GamesView,
+        icons,
+        launcher::LauncherView,
+        minecraft::MinecraftView,
+        monitor::MonitorView,
+        notes::NotesView,
+        spotify::SpotifyView,
+        system::SystemView,
+        welcome::Welcome,
     },
 };
 
@@ -59,6 +69,8 @@ pub struct Shared {
     /// Zählt Änderungen an den Einstellungen – das Design wird dann neu angewendet.
     settings_version: u64,
     toast: Option<(String, f64)>,
+    /// Ansichten setzen hier den Wunsch, einen Vollbildmodus zu starten.
+    pub blackout_request: Option<BlackoutMode>,
 }
 
 impl Shared {
@@ -138,17 +150,17 @@ impl Tab {
             Tab::Notes => "Notizen",
             Tab::Calculator => "Rechner",
             Tab::Launcher => "App-Starter",
-            Tab::Monitor => "Monitor",
+            Tab::Monitor => "Task-Manager",
             Tab::Minecraft => "Minecraft",
-            Tab::Games => "Game Timer",
+            Tab::Games => "Spielzeit",
             Tab::Clock => "Uhr",
             Tab::System => "Einstellungen",
         }
     }
 
-    /// Die Einstellungen lassen sich nicht ausblenden – sonst käme man nicht mehr zurück.
+    /// Die Einstellungen sind immer auch über das Zahnrad oben rechts erreichbar.
     pub fn can_hide(self) -> bool {
-        self != Tab::System
+        true
     }
 }
 
@@ -223,8 +235,8 @@ enum SidebarAction {
     Hide(Tab),
 }
 
-/// Nutzlast beim Ziehen eines Werkzeugs in der Seitenleiste.
-struct TabDrag(Tab);
+/// Nutzlast beim Ziehen eines Werkzeugs (Seitenleiste und Einstellungen).
+pub(crate) struct TabDrag(pub(crate) Tab);
 
 pub struct App {
     tab: Tab,
@@ -248,7 +260,13 @@ pub struct App {
     games_view: GamesView,
     clock_view: ClockView,
 
-    system_view: SystemView,
+    /// Zweite Ansicht der Einstellungen für das große Fenster.
+    popup_view: SystemView,
+    settings_open: bool,
+    blackout: Blackout,
+    welcome: Option<Welcome>,
+    sent_interval: u64,
+    sent_history_days: u32,
 }
 
 /// Stellt die Windows-Systemschrift vor die eingebauten Schriften.
@@ -295,7 +313,10 @@ impl App {
         } else {
             &settings.start_tab
         };
-        let tab = Tab::from_key(start_key).unwrap_or(Tab::Spotify);
+        // Die Einstellungen sind ein Fenster, kein Tab.
+        let tab = Tab::from_key(start_key)
+            .filter(|tab| *tab != Tab::System)
+            .unwrap_or(Tab::Spotify);
 
         // Unter Linux bräuchte das Tray eine eigene GTK-Schleife – dort läuft die App ohne.
         let tray = if cfg!(target_os = "linux") {
@@ -318,14 +339,12 @@ impl App {
 
         // Programme schon beim Start suchen – der App-Starter ist dann sofort gefüllt.
         crate::i18n::set_english(settings.language == Language::English);
-        let clock_view = ClockView::new(
-            &settings.alarms,
-            settings.countdown_secs,
-            cc.egui_ctx.clone(),
-        );
+        let clock_view =
+            ClockView::new(&settings.alarms, &settings.countdowns, cc.egui_ctx.clone());
         let mut launcher_view = LauncherView::default();
         launcher_view.start_scan(&cc.egui_ctx);
 
+        let welcome = (!settings.onboarded).then(Welcome::default);
         Ok(Self {
             tab,
             styled_for: None,
@@ -347,6 +366,7 @@ impl App {
                 now: 0.0,
                 settings_version: 0,
                 toast: None,
+                blackout_request: None,
             },
             spotify_view: SpotifyView::default(),
             clipboard_view: ClipboardView::default(),
@@ -357,7 +377,13 @@ impl App {
             minecraft_view: MinecraftView::default(),
             games_view: GamesView::default(),
             clock_view,
-            system_view: SystemView::default(),
+
+            popup_view: SystemView::default(),
+            settings_open: false,
+            blackout: Blackout::default(),
+            welcome,
+            sent_interval: 0,
+            sent_history_days: 0,
         })
     }
 
@@ -370,8 +396,11 @@ impl App {
             crate::i18n::set_english(settings.language == Language::English);
             ctx.set_theme(match settings.appearance {
                 Appearance::System => egui::ThemePreference::System,
-                Appearance::Light => egui::ThemePreference::Light,
-                Appearance::Dark => egui::ThemePreference::Dark,
+                Appearance::Light | Appearance::HighContrastLight => egui::ThemePreference::Light,
+                Appearance::Dark | Appearance::Oled | Appearance::HighContrastDark => {
+                    egui::ThemePreference::Dark
+                }
+                Appearance::Custom => egui::ThemePreference::System,
             });
             ctx.set_zoom_factor(settings.zoom.clamp(0.75, 1.5));
         }
@@ -468,6 +497,9 @@ impl App {
                     if window_button(ui, &p, WindowButton::Minimize) {
                         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                     }
+                    if window_button(ui, &p, WindowButton::Settings) {
+                        self.settings_open = !self.settings_open;
+                    }
                 });
             });
     }
@@ -478,8 +510,11 @@ impl App {
         let mut selected = None;
         let mut action = None;
 
+        let collapsed = self.shared.settings.sidebar_collapsed;
+        let settings_open = self.settings_open;
+        let mut toggle = false;
         SidePanel::left("sidebar")
-            .exact_width(196.0)
+            .exact_width(if collapsed { 52.0 } else { 196.0 })
             .resizable(false)
             .show_separator_line(false)
             .frame(Frame::none().fill(p.sidebar_bg).inner_margin(Margin {
@@ -490,8 +525,17 @@ impl App {
             }))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
+                if sidebar_toggle(ui, &p, collapsed) {
+                    toggle = true;
+                }
+                ui.add_space(2.0);
                 for (index, tab) in tabs.iter().copied().enumerate() {
-                    let row = theme::nav_item(ui, &p, tab.label(), self.tab == tab);
+                    let is_current = if tab == Tab::System {
+                        settings_open
+                    } else {
+                        self.tab == tab
+                    };
+                    let row = sidebar_item(ui, &p, tab, is_current, collapsed);
                     if row.clicked() {
                         selected = Some(tab);
                     }
@@ -535,8 +579,16 @@ impl App {
                 }
             });
 
+        if toggle {
+            self.shared.settings.sidebar_collapsed = !collapsed;
+            self.shared.save_settings();
+        }
         if let Some(tab) = selected {
-            self.select_tab(tab);
+            if tab == Tab::System {
+                self.settings_open = true;
+            } else {
+                self.select_tab(tab);
+            }
         }
         match action {
             Some(SidebarAction::Move(tab, direction)) => {
@@ -561,16 +613,56 @@ impl App {
 
     fn content(&mut self, ctx: &egui::Context) {
         let p = self.shared.palette;
-        let frame = Frame::none().fill(p.content_bg).inner_margin(Margin {
-            left: 24.0,
-            right: 24.0,
-            top: 14.0,
+        let fill = if self.tab == Tab::Spotify {
+            self.spotify_view
+                .background(&self.shared)
+                .unwrap_or(p.content_bg)
+        } else {
+            p.content_bg
+        };
+        let frame = Frame::none().fill(fill).inner_margin(Margin {
+            left: if p.compact { 14.0 } else { 24.0 },
+            right: if p.compact { 14.0 } else { 24.0 },
+            top: if p.compact { 8.0 } else { 14.0 },
             bottom: 0.0,
         });
 
         CentralPanel::default().frame(frame).show(ctx, |ui| {
-            ui.label(RichText::new(self.tab.label()).size(22.0).strong());
-            ui.add_space(6.0);
+            let mut refresh = ui.input(|i| i.key_pressed(egui::Key::F5));
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.tab.label())
+                        .size(if p.compact { 18.0 } else { 22.0 })
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(crate::i18n::t("Aktualisieren"))
+                        .on_hover_text(crate::i18n::t("Ansicht neu laden (F5)"))
+                        .clicked()
+                    {
+                        refresh = true;
+                    }
+                });
+            });
+            if refresh {
+                match self.tab {
+                    Tab::Clipboard => self.clipboard_view.refresh(),
+                    Tab::Launcher => self.launcher_view.refresh(ctx),
+                    Tab::Monitor => self.monitor_view.refresh(ctx, &mut self.shared),
+                    Tab::Minecraft => self.minecraft_view.reload(&self.shared),
+                    _ => {}
+                }
+                ctx.request_repaint();
+            }
+            ui.add_space(if p.compact { 3.0 } else { 6.0 });
+
+            // Seitenwahl bleibt oben stehen, auch wenn der Inhalt scrollt.
+            match self.tab {
+                Tab::Monitor => self.monitor_view.header(ui, &mut self.shared),
+                Tab::Minecraft => self.minecraft_view.header(ui, &mut self.shared),
+                _ => {}
+            }
 
             if self.tab == Tab::Notes {
                 // Die Notizansicht teilt ihre Fläche selbst auf und scrollt intern.
@@ -589,13 +681,75 @@ impl App {
                         Tab::Minecraft => self.minecraft_view.ui(ui, &mut self.shared),
                         Tab::Games => self.games_view.ui(ui, &mut self.shared),
                         Tab::Clock => self.clock_view.ui(ui, &mut self.shared),
-                        Tab::System => self.system_view.ui(ui, &mut self.shared),
+                        Tab::System => {}
                         Tab::Notes => {}
                     }
                     // Luft unter dem letzten Element, damit nichts am Fensterrand klebt.
                     ui.add_space(24.0);
                 });
         });
+    }
+
+    /// Einstellungen als großes Fenster über allem (Zahnrad oben rechts).
+    fn settings_popup(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let p = self.shared.palette;
+        let screen = ctx.screen_rect();
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        egui::Area::new(Id::new("settings_dim"))
+            .order(Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, Color32::from_black_alpha(150));
+                if response.clicked() {
+                    close = true;
+                }
+            });
+
+        let width = (screen.width() - 80.0).clamp(320.0, 1200.0);
+        let height = (screen.height() - 70.0).max(240.0);
+        let pos = egui::pos2(
+            screen.center().x - width / 2.0,
+            screen.top() + TITLE_BAR_HEIGHT + 8.0,
+        );
+        egui::Area::new(Id::new("settings_popup"))
+            .order(Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                Frame::none()
+                    .fill(p.content_bg)
+                    .stroke(Stroke::new(1.0_f32, p.separator))
+                    .rounding(p.radius + 4.0)
+                    .inner_margin(Margin::symmetric(18.0, 12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 36.0);
+                        ui.set_height(height - 24.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(t("Einstellungen")).size(20.0).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button(t("Schließen")).clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ScrollArea::vertical()
+                            .id_salt("settings_popup_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                self.popup_view.ui(ui, &mut self.shared);
+                                ui.add_space(16.0);
+                            });
+                    });
+            });
+        if close {
+            self.settings_open = false;
+        }
     }
 
     /// Meldung unten rechts, im Stil einer Windows-Benachrichtigung.
@@ -650,22 +804,49 @@ impl eframe::App for App {
         self.shared.now = ctx.input(|i| i.time);
         self.sync_theme(ctx);
         self.handle_lifecycle(ctx);
-        self.shared
-            .spotify
-            .set_polling(self.tab == Tab::Spotify && self.window.is_visible());
+        self.shared.spotify.set_polling(
+            (self.tab == Tab::Spotify && self.window.is_visible()) || self.blackout.wants_spotify(),
+        );
+        if self.sent_interval != self.shared.settings.monitor_interval_ms {
+            self.sent_interval = self.shared.settings.monitor_interval_ms;
+            self.shared
+                .monitor
+                .send(crate::services::monitor::Command::Interval(
+                    self.sent_interval,
+                ));
+        }
+        if self.sent_history_days != self.shared.settings.history_days {
+            self.sent_history_days = self.shared.settings.history_days;
+            self.shared
+                .monitor
+                .send(crate::services::monitor::Command::Retention(
+                    self.sent_history_days,
+                ));
+        }
         self.shared
             .monitor
             .set_active(self.tab == Tab::Monitor && self.window.is_visible());
 
         // Wecker und Vollbildfläche laufen unabhängig vom offenen Werkzeug.
-        if self.clock_view.background(ctx, &mut self.shared) {
+        if self.clock_view.background(&mut self.shared) {
             self.window.show(ctx);
             self.select_tab(Tab::Clock);
         }
 
+        if let Some(mode) = self.shared.blackout_request.take() {
+            self.blackout.start(mode, &mut self.shared);
+        }
+        self.blackout.show(ctx, &mut self.shared);
+
         self.title_bar(ctx);
         self.sidebar(ctx);
         self.content(ctx);
+        self.settings_popup(ctx);
+        if let Some(welcome) = &mut self.welcome {
+            if welcome.show(ctx, &mut self.shared) {
+                self.welcome = None;
+            }
+        }
 
         // Feine Kontur um das Fenster – nicht im Vollbild, dort gibt es keinen Rand.
         let fills_screen = ctx.input(|i| {
@@ -687,10 +868,93 @@ impl eframe::App for App {
     }
 }
 
+// ───────── Seitenleisten-Elemente ─────────
+
+/// Knopf zum Ein- und Ausklappen der Seitenleiste. Liefert `true` bei Klick.
+fn sidebar_toggle(ui: &mut Ui, p: &Palette, collapsed: bool) -> bool {
+    let height = if p.compact { 26.0 } else { 32.0 };
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, p.radius, p.selection.gamma_multiply(0.6));
+    }
+    let center = egui::pos2(rect.left() + 16.0, rect.center().y);
+    let center = if collapsed {
+        egui::pos2(rect.center().x, rect.center().y)
+    } else {
+        center
+    };
+    icons::menu(ui.painter(), center, 16.0, p.text_secondary);
+    response
+        .on_hover_text(if collapsed {
+            t("Seitenleiste ausklappen")
+        } else {
+            t("Seitenleiste einklappen")
+        })
+        .clicked()
+}
+
+/// Eintrag der Seitenleiste: Symbol, bei ausgeklappter Leiste mit Beschriftung.
+fn sidebar_item(
+    ui: &mut Ui,
+    p: &Palette,
+    tab: Tab,
+    selected: bool,
+    collapsed: bool,
+) -> egui::Response {
+    let height = if p.compact { 26.0 } else { 32.0 };
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        Sense::click_and_drag(),
+    );
+    if ui.is_rect_visible(rect) {
+        if selected {
+            ui.painter().rect_filled(rect, p.radius, p.selection);
+            let bar = Rect::from_center_size(
+                egui::pos2(rect.left() + 1.5, rect.center().y),
+                egui::vec2(3.0, 16.0),
+            );
+            ui.painter().rect_filled(bar, 1.5, p.accent);
+        } else if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, p.radius, p.selection.gamma_multiply(0.6));
+        }
+        let color = if selected { p.accent } else { p.text };
+        let icon_center = if collapsed {
+            rect.center()
+        } else {
+            egui::pos2(rect.left() + 16.0, rect.center().y)
+        };
+        icons::draw(ui.painter(), icon_center, 16.0, tab, color);
+        if !collapsed {
+            let text_rect = Rect::from_min_max(
+                egui::pos2(rect.left() + 34.0, rect.top()),
+                egui::pos2(rect.right() - 6.0, rect.bottom()),
+            );
+            let galley = ui.painter().layout_no_wrap(
+                tab.label().to_owned(),
+                egui::FontId::proportional(14.0),
+                p.text,
+            );
+            let pos = egui::pos2(text_rect.left(), rect.center().y - galley.size().y / 2.0);
+            ui.painter()
+                .with_clip_rect(text_rect)
+                .galley(pos, galley, p.text);
+        }
+    }
+    if collapsed {
+        response.on_hover_text(tab.label())
+    } else {
+        response
+    }
+}
+
 // ───────── Fensterrahmen ─────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WindowButton {
+    Settings,
     Minimize,
     Maximize,
     Close,
@@ -716,6 +980,15 @@ fn window_button(ui: &mut Ui, p: &Palette, kind: WindowButton) -> bool {
     let stroke = Stroke::new(1.0_f32, foreground);
     let painter = ui.painter();
     match kind {
+        WindowButton::Settings => {
+            // Zahnrad: Ring mit acht Zähnen.
+            painter.circle_stroke(center, 3.0, stroke);
+            for step in 0..8 {
+                let angle = step as f32 * std::f32::consts::FRAC_PI_4;
+                let dir = egui::vec2(angle.cos(), angle.sin());
+                painter.line_segment([center + dir * 4.6, center + dir * 6.4], stroke);
+            }
+        }
         WindowButton::Minimize => {
             painter.line_segment(
                 [

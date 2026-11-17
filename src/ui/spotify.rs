@@ -5,6 +5,7 @@ use crate::{
     app::Shared,
     services::spotify::{self, Command, Snapshot},
     theme::{self, Palette},
+    ui::{blackout::Mode, clock::screen_picker},
 };
 
 const ARTWORK_SIDE: f32 = 220.0;
@@ -21,6 +22,8 @@ pub struct SpotifyView {
     /// Lautstärke während des Ziehens – verhindert Springen durch das Polling.
     volume_draft: Option<f32>,
     last_volume_sent: f64,
+    /// Hauptfarbe des Covers, berechnet einmal je Cover (ID).
+    cover_color: Option<(u64, [u8; 3])>,
 }
 
 fn format_time(ms: i64) -> String {
@@ -119,13 +122,45 @@ impl SpotifyView {
         }
     }
 
+    /// Hintergrundfarbe der Seite: auf Wunsch eine abgedunkelte Cover-Farbe.
+    pub fn background(&mut self, shared: &Shared) -> Option<egui::Color32> {
+        if !shared.settings.spotify_cover_accent {
+            return None;
+        }
+        let snapshot = shared.spotify.snapshot();
+        let artwork = snapshot.artwork.as_ref()?;
+        if self.cover_color.map(|(id, _)| id) != Some(artwork.id) {
+            self.cover_color = Some((artwork.id, artwork.dominant_color()));
+        }
+        let (_, [r, g, b]) = self.cover_color?;
+        let base = shared.palette.content_bg;
+        // Cover-Farbe sanft in den normalen Hintergrund mischen.
+        let mix = |color: u8, base: u8| (color as f32 * 0.22 + base as f32 * 0.78) as u8;
+        Some(egui::Color32::from_rgb(
+            mix(r, base.r()),
+            mix(g, base.g()),
+            mix(b, base.b()),
+        ))
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, shared: &mut Shared) {
         if let Some(error) = shared.spotify.take_error() {
             shared.notify(error);
         }
-        let p = shared.palette;
         let snapshot = shared.spotify.snapshot();
         self.sync_artwork(ui, &snapshot);
+        // Auf Wunsch die Hauptfarbe des Covers als Akzent dieses Tabs.
+        let mut p = shared.palette;
+        if shared.settings.spotify_cover_accent {
+            if let Some(artwork) = &snapshot.artwork {
+                if self.cover_color.map(|(id, _)| id) != Some(artwork.id) {
+                    self.cover_color = Some((artwork.id, artwork.dominant_color()));
+                }
+                if let Some((_, color)) = self.cover_color {
+                    p = p.with_accent(color);
+                }
+            }
+        }
         let playback = snapshot.playback.as_ref();
         let is_playing = playback.is_some_and(|pb| pb.is_playing);
 
@@ -300,7 +335,7 @@ impl SpotifyView {
                     }
 
                     // Lautstärke der Spotify-App (Windows-Lautstärkemixer).
-                    if shared.settings.show_volume {
+                                        {
                         if let Some(device_volume) = snapshot.volume {
                             ui.add_space(8.0);
                             let slider_width = 180.0;
@@ -333,11 +368,28 @@ impl SpotifyView {
                                 if !slider.dragged()
                                     && self.volume_draft.map(f32::round) == Some(reported)
                                 {
-                                    self.volume_draft = None;
+                                                                        self.volume_draft = None;
                                 }
                             });
                         }
                     }
+
+                    // Vollbild: Cover und Titel auf den gewählten Bildschirmen.
+                                        ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        // Grob mittig: Knopf (~90) + Auswahl (~170).
+                        ui.add_space(((ui.available_width() - 270.0) / 2.0).max(0.0));
+                        if ui
+                            .button(t("Vollbild"))
+                            .on_hover_text(t(
+                                "Zeigt die Wiedergabe im Vollbild auf den gewählten Bildschirmen. Beenden mit F11, Esc oder deiner eigenen Taste.",
+                            ))
+                            .clicked()
+                        {
+                            shared.blackout_request = Some(Mode::Spotify);
+                        }
+                        screen_picker(ui, shared);
+                    });
                 });
             });
         });

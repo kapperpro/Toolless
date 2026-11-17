@@ -244,10 +244,6 @@ mod desktop {
         bottom: i32,
     }
 
-    const SM_XVIRTUALSCREEN: i32 = 76;
-    const SM_YVIRTUALSCREEN: i32 = 77;
-    const SM_CXVIRTUALSCREEN: i32 = 78;
-    const SM_CYVIRTUALSCREEN: i32 = 79;
     const HWND_TOPMOST: isize = -1;
     const SWP_SHOWWINDOW: u32 = 0x0040;
     const MB_ICONEXCLAMATION: u32 = 0x30;
@@ -260,7 +256,6 @@ mod desktop {
     #[link(name = "user32")]
     extern "system" {
         fn MessageBeep(kind: u32) -> i32;
-        fn GetSystemMetrics(index: i32) -> i32;
         fn FindWindowW(class: *const u16, title: *const u16) -> isize;
         fn SetWindowPos(
             window: isize,
@@ -272,6 +267,7 @@ mod desktop {
             flags: u32,
         ) -> i32;
         fn SetForegroundWindow(window: isize) -> i32;
+        fn GetAsyncKeyState(key: i32) -> i16;
         fn EnumDisplayMonitors(
             dc: isize,
             clip: *const Rect,
@@ -303,18 +299,6 @@ mod desktop {
     }
 
     /// Gesamtfläche aller Bildschirme in Pixeln: x, y, Breite, Höhe.
-    pub fn virtual_screen() -> [i32; 4] {
-        // SAFETY: Aufrufe ohne Zeiger.
-        unsafe {
-            [
-                GetSystemMetrics(SM_XVIRTUALSCREEN),
-                GetSystemMetrics(SM_YVIRTUALSCREEN),
-                GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            ]
-        }
-    }
-
     unsafe extern "system" fn collect(
         _monitor: isize,
         _dc: isize,
@@ -351,10 +335,28 @@ mod desktop {
         screens
     }
 
-    /// Legt das Fenster mit diesem Titel über alle Bildschirme und holt es nach vorn.
-    pub fn cover_all_screens(title: &str, focus: bool) -> bool {
+    /// Ist diese Taste (Windows-Tastencode, auch Maustasten) gerade gedrückt? Funktioniert auch,
+    /// wenn das eigene Fenster keinen Fokus hat.
+    pub fn key_down(code: i32) -> bool {
+        // SAFETY: Aufruf ohne Zeiger; ungültige Codes liefern 0.
+        unsafe { GetAsyncKeyState(code) < 0 }
+    }
+
+    /// Ist irgendeine Taste oder Maustaste gedrückt (ohne Umschalttasten)?
+    pub fn any_key_down() -> bool {
+        // Maustasten 1, 2, 4 sowie Tasten von Rücktaste bis zum Ende; Umschalt-, Strg- und
+        // Alt-Tasten (0x10–0x12, 0xA0–0xA5) zählen nicht.
+        (0x01..=0x06).any(key_down)
+            || (0x08..=0xFE)
+                .filter(|code| !matches!(code, 0x10..=0x12 | 0xA0..=0xA5))
+                .any(key_down)
+    }
+
+    /// Legt das Fenster mit diesem Titel auf das Rechteck `[x, y, Breite, Höhe]` (Pixel) und
+    /// holt es nach vorn.
+    pub fn place_window(title: &str, rect: [i32; 4], focus: bool) -> bool {
         let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-        let [x, y, width, height] = virtual_screen();
+        let [x, y, width, height] = rect;
         // SAFETY: `title` ist nullterminiert; ein unbekanntes Fenster liefert 0.
         unsafe {
             let window = FindWindowW(ptr::null(), title.as_ptr());
@@ -385,20 +387,24 @@ mod desktop {
 
     pub fn beep() {}
 
-    pub fn virtual_screen() -> [i32; 4] {
-        [0, 0, 0, 0]
-    }
-
     pub fn screens() -> Vec<[i32; 4]> {
         Vec::new()
     }
 
-    pub fn cover_all_screens(_title: &str, _focus: bool) -> bool {
+    pub fn key_down(_code: i32) -> bool {
+        false
+    }
+
+    pub fn any_key_down() -> bool {
+        false
+    }
+
+    pub fn place_window(_title: &str, _rect: [i32; 4], _focus: bool) -> bool {
         false
     }
 }
 
-pub use desktop::{beep, cover_all_screens, local_time, screens, virtual_screen};
+pub use desktop::{any_key_down, beep, key_down, local_time, place_window, screens};
 
 /// Kalenderdatum und Uhrzeit eines Zeitstempels (Sekunden seit 1970) in Ortszeit:
 /// Jahr, Monat, Tag, Stunde, Minute.
@@ -417,3 +423,10 @@ pub fn local_parts(time: u64) -> (i64, i64, i64, i64, i64) {
     let year = yoe + era * 400 + i64::from(month <= 2);
     (year, month, day, seconds / 3600, seconds % 3600 / 60)
 }
+
+/// Von RivaTuner Statistics Server (MSI Afterburner) gelesenes Exportsymbol: Existiert es,
+/// hängt sich RTSS nicht in diese Anwendung ein. Der Linker-Parameter steht in `build.rs`.
+#[no_mangle]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static RTSSHooksCompatibility: u32 = 0;

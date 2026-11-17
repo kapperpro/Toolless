@@ -18,6 +18,15 @@ pub struct Alarm {
     pub repeat: bool,
 }
 
+/// Ein Countdown; `end` ist gesetzt, solange er läuft (Sekunden seit 1970).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Countdown {
+    pub id: u64,
+    pub label: String,
+    pub secs: u32,
+    pub end: Option<u64>,
+}
+
 /// Zeitpunkt, wie ihn der Prüf-Thread sieht.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Moment {
@@ -30,8 +39,7 @@ pub struct Moment {
 #[derive(Default)]
 pub struct State {
     pub alarms: Vec<Alarm>,
-    /// Ende des laufenden Countdowns (Sekunden seit 1970).
-    pub countdown_end: Option<u64>,
+    pub countdowns: Vec<Countdown>,
     /// Text dessen, was gerade klingelt.
     pub ringing: Option<String>,
     /// Der Thread hat einen einmaligen Wecker abgeschaltet – die GUI soll speichern.
@@ -65,10 +73,16 @@ impl State {
             }
             rang = true;
         }
-        if self.countdown_end.is_some_and(|end| unix >= end) {
-            self.countdown_end = None;
-            self.ringing = Some("Countdown abgelaufen".to_owned());
-            rang = true;
+        for countdown in &mut self.countdowns {
+            if countdown.end.is_some_and(|end| unix >= end) {
+                countdown.end = None;
+                self.ringing = Some(if countdown.label.trim().is_empty() {
+                    "Countdown abgelaufen".to_owned()
+                } else {
+                    format!("{}: Countdown abgelaufen", countdown.label.trim())
+                });
+                rang = true;
+            }
         }
         rang
     }
@@ -95,12 +109,14 @@ impl ClockHandle {
     /// `now` liefert die Ortszeit, `beep` gibt einen Signalton aus und `wake` weckt die GUI.
     pub fn spawn(
         alarms: Vec<Alarm>,
+        countdowns: Vec<Countdown>,
         now: fn() -> Moment,
         beep: fn(),
         wake: impl Fn() + Send + 'static,
     ) -> Self {
         let state = Arc::new(Mutex::new(State {
             alarms,
+            countdowns,
             ..State::default()
         }));
         let worker = Arc::clone(&state);
@@ -172,7 +188,20 @@ mod tests {
     #[test]
     fn countdown_fires_at_its_end() {
         let mut state = State {
-            countdown_end: Some(100),
+            countdowns: vec![
+                Countdown {
+                    id: 1,
+                    label: String::new(),
+                    secs: 100,
+                    end: Some(100),
+                },
+                Countdown {
+                    id: 2,
+                    label: "Tee".to_owned(),
+                    secs: 200,
+                    end: Some(200),
+                },
+            ],
             ..State::default()
         };
         let moment = Moment {
@@ -182,7 +211,10 @@ mod tests {
         };
         assert!(!state.check(moment, 99));
         assert!(state.check(moment, 100));
-        assert_eq!(state.countdown_end, None);
+        assert_eq!(state.countdowns[0].end, None);
+        assert_eq!(state.countdowns[1].end, Some(200));
         assert_eq!(state.ringing.as_deref(), Some("Countdown abgelaufen"));
+        assert!(state.check(moment, 200));
+        assert_eq!(state.ringing.as_deref(), Some("Tee: Countdown abgelaufen"));
     }
 }

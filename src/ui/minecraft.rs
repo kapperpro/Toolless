@@ -29,6 +29,16 @@ enum Action {
     AddFolder,
     RemoveFolder(usize),
     Refresh,
+    SaveSeed(String, String, String),
+    RemoveSeed(usize),
+}
+
+/// Untertabs des Minecraft-Moduls.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Sub {
+    #[default]
+    Mca,
+    SeedMap,
 }
 
 #[derive(Default)]
@@ -39,6 +49,9 @@ pub struct MinecraftView {
     search: String,
     seed_input: String,
     version_input: String,
+    name_input: String,
+    sub: Sub,
+
     /// Vorschaubilder der Welten; `None` = Datei ließ sich nicht lesen.
     icons: HashMap<PathBuf, Option<TextureHandle>>,
 }
@@ -76,6 +89,15 @@ fn format_last_played(ms: i64) -> String {
     }
 }
 
+fn td_seed_name(seed: &str) -> String {
+    let seed = seed.trim();
+    if seed.chars().count() > 18 {
+        format!("{}…", seed.chars().take(18).collect::<String>())
+    } else {
+        format!("Seed {seed}")
+    }
+}
+
 /// Die drei Karten-Schaltflächen für einen Seed.
 fn map_buttons(ui: &mut Ui, seed: Option<i64>, version: &str, action: &mut Option<Action>) {
     for map in SeedMap::ALL {
@@ -86,7 +108,7 @@ fn map_buttons(ui: &mut Ui, seed: Option<i64>, version: &str, action: &mut Optio
 }
 
 impl MinecraftView {
-    fn reload(&mut self, shared: &Shared) {
+    pub fn reload(&mut self, shared: &Shared) {
         self.worlds = minecraft::scan_worlds(&shared.settings.minecraft_folders);
         self.mca_selector = minecraft::find_mca_selector(&shared.settings.mca_selector_path);
     }
@@ -166,6 +188,23 @@ impl MinecraftView {
                     self.reload(shared);
                 }
             }
+                        Action::SaveSeed(name, seed, version) => {
+                let name = if name.trim().is_empty() {
+                    td_seed_name(&seed)
+                } else {
+                    name.trim().to_owned()
+                };
+                shared.settings.minecraft_seeds.push((name, seed, version));
+                shared.save_settings();
+                self.name_input.clear();
+                shared.notify(t("Seed gemerkt"));
+            }
+            Action::RemoveSeed(index) => {
+                if index < shared.settings.minecraft_seeds.len() {
+                    shared.settings.minecraft_seeds.remove(index);
+                    shared.save_settings();
+                }
+            }
             Action::Refresh => {
                 self.reload(shared);
                 shared.notify(crate::i18n::td(format!("{} Welten gefunden", self.worlds.len())));
@@ -173,7 +212,7 @@ impl MinecraftView {
         }
     }
 
-    fn tools(&mut self, ui: &mut Ui, p: &Palette, action: &mut Option<Action>) {
+    fn mca_card(&mut self, ui: &mut Ui, p: &Palette, action: &mut Option<Action>) {
         // ── MCA Selector ──
         theme::card(p).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -204,35 +243,6 @@ impl MinecraftView {
                     p,
                     t("Chunks ansehen, filtern, löschen und exportieren. Die Schaltfläche „MCA Selector“ bei \
                      einer Welt startet das Programm und öffnet die Welt darin."),
-                )
-                .size(12.5),
-            );
-        });
-
-        // ── Seed-Karte ──
-        theme::card(p).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::card_title(ui, t("Seed-Karte"));
-            ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    TextEdit::singleline(&mut self.seed_input)
-                        .hint_text(t("Seed (Zahl oder Text)"))
-                        .desired_width(220.0),
-                );
-                ui.add(
-                    TextEdit::singleline(&mut self.version_input)
-                        .hint_text(t("Version, z. B. 1.21.4"))
-                        .desired_width(150.0),
-                );
-                let seed = minecraft::seed_from_text(&self.seed_input);
-                map_buttons(ui, seed, self.version_input.trim(), action);
-            });
-            ui.label(
-                theme::secondary(
-                    p,
-                    "Chunkbase: Strukturen · mcseedmap.net: Biome und Seed-Suche · Datapack-Karte: \
-                     Biome und Strukturen mit Datapacks und Mods. Die Karten öffnen im Browser; der \
-                     Seed wird zusätzlich kopiert.",
                 )
                 .size(12.5),
             );
@@ -335,7 +345,6 @@ impl MinecraftView {
                     if ui.button(t("Seed kopieren")).clicked() {
                         *action = Some(Action::CopySeed(seed));
                     }
-                    map_buttons(ui, Some(seed), &world.version, action);
                 }
                 if ui.button(t("Ordner öffnen")).clicked() {
                     *action = Some(Action::OpenFolder(world.folder.clone()));
@@ -357,38 +366,78 @@ impl MinecraftView {
         });
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, shared: &mut Shared) {
-        let p = shared.palette;
-        if !self.loaded {
-            self.loaded = true;
-            self.reload(shared);
-        }
-        let mut action = None;
-        self.tools(ui, &p, &mut action);
+    /// Kompakte Zeile einer Welt im Seed-Map-Tab: Seed und die Karten-Schaltflächen.
+    fn seed_world_row(&self, ui: &mut Ui, p: &Palette, world: &World, action: &mut Option<Action>) {
+        theme::card(p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                self.world_icon(ui, p, world);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&world.name).strong().size(15.0));
+                        if !world.version.is_empty() {
+                            theme::badge(ui, p, &world.version);
+                        }
+                    });
+                    if !world.pack.is_empty() {
+                        ui.label(RichText::new(&world.pack).color(p.accent));
+                    }
+                    let seed_text = world.seed.map_or_else(
+                        || t("Seed nicht gefunden").to_owned(),
+                        |seed| format!("Seed {seed}"),
+                    );
+                    ui.label(theme::secondary(p, seed_text).size(12.5));
+                });
+            });
+            if let Some(seed) = world.seed {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(t("Seed kopieren")).clicked() {
+                        *action = Some(Action::CopySeed(seed));
+                    }
+                    if ui
+                        .button(t("Seed merken"))
+                        .on_hover_text(t("Legt den Seed in „Meine Seeds“ ab"))
+                        .clicked()
+                    {
+                        *action = Some(Action::SaveSeed(
+                            world.name.clone(),
+                            seed.to_string(),
+                            world.version.clone(),
+                        ));
+                    }
+                    map_buttons(ui, Some(seed), &world.version, action);
+                });
+            }
+        });
+    }
 
-        // ── Welten ──
-        ui.add_space(4.0);
+    /// Suchfeld und Liste der Welten (für beide Untertabs).
+    fn worlds_section(&mut self, ui: &mut Ui, shared: &Shared, action: &mut Option<Action>) {
+        let p = shared.palette;
+        let compact = self.sub == Sub::SeedMap;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(crate::i18n::td(format!("Welten ({})", self.worlds.len()))).strong(),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .button(t("Ordner hinzufügen …"))
-                    .on_hover_text(t(
-                        "Für Launcher oder Instanzen, die nicht automatisch gefunden werden",
-                    ))
-                    .clicked()
-                {
-                    action = Some(Action::AddFolder);
+                if !compact {
+                    if ui
+                        .button(t("Ordner hinzufügen …"))
+                        .on_hover_text(t(
+                            "Für Launcher oder Instanzen, die nicht automatisch gefunden werden",
+                        ))
+                        .clicked()
+                    {
+                        *action = Some(Action::AddFolder);
+                    }
                 }
                 if ui.button(t("Aktualisieren")).clicked() {
-                    action = Some(Action::Refresh);
+                    *action = Some(Action::Refresh);
                 }
                 ui.add(
                     TextEdit::singleline(&mut self.search)
                         .hint_text(t("Welt, Modpack, Version oder Launcher suchen"))
-                        .desired_width(240.0),
+                        .desired_width(if compact { 150.0 } else { 240.0 }),
                 );
             });
         });
@@ -397,11 +446,11 @@ impl MinecraftView {
                 ui.label(theme::secondary(&p, t("Eigene Ordner:")).size(12.5));
                 for (index, folder) in shared.settings.minecraft_folders.iter().enumerate() {
                     if ui
-                        .small_button(format!("{folder}  ✕"))
+                        .small_button(format!("{folder}  ×"))
                         .on_hover_text(t("Ordner aus der Liste entfernen"))
                         .clicked()
                     {
-                        action = Some(Action::RemoveFolder(index));
+                        *action = Some(Action::RemoveFolder(index));
                     }
                 }
             });
@@ -445,12 +494,157 @@ impl MinecraftView {
             .collect();
 
         for world in visible {
-            self.world_card(ui, &p, world, &mut action);
+            if compact {
+                self.seed_world_row(ui, &p, world, action);
+            } else {
+                self.world_card(ui, &p, world, action);
+            }
         }
 
         self.icons.extend(loaded);
         if more_to_load {
             ui.ctx().request_repaint();
+        }
+    }
+
+    /// Seed eintippen, Karten öffnen und Seeds merken.
+    fn seeds_card(&mut self, ui: &mut Ui, shared: &Shared, action: &mut Option<Action>) {
+        let p = shared.palette;
+        theme::card(&p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::card_title(ui, t("Seed-Karte"));
+            ui.add(
+                TextEdit::singleline(&mut self.seed_input)
+                    .hint_text(t("Seed (Zahl oder Text)"))
+                    .desired_width(f32::INFINITY),
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    TextEdit::singleline(&mut self.version_input)
+                        .hint_text(t("Version, z. B. 1.21.4"))
+                        .desired_width(130.0),
+                );
+                ui.add(
+                    TextEdit::singleline(&mut self.name_input)
+                        .hint_text(t("Name (optional)"))
+                        .desired_width(f32::INFINITY),
+                );
+            });
+            let seed = minecraft::seed_from_text(&self.seed_input);
+            ui.horizontal_wrapped(|ui| {
+                map_buttons(ui, seed, self.version_input.trim(), action);
+            });
+            let can_save = !self.seed_input.trim().is_empty();
+            if ui
+                .add_enabled(can_save, Button::new(t("Seed merken")))
+                .clicked()
+            {
+                *action = Some(Action::SaveSeed(
+                    self.name_input.clone(),
+                    self.seed_input.trim().to_owned(),
+                    self.version_input.trim().to_owned(),
+                ));
+            }
+        });
+
+        theme::card(&p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::card_title(ui, t("Meine Seeds"));
+            if shared.settings.minecraft_seeds.is_empty() {
+                ui.label(
+                    theme::secondary(&p, t("Noch keine Seeds gemerkt. Gib oben einen Seed ein oder nimm ihn von einer Welt."))
+                        .size(12.5),
+                );
+            }
+            for (index, (name, seed_text, version)) in
+                shared.settings.minecraft_seeds.iter().enumerate()
+            {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(name).strong());
+                    if !version.is_empty() {
+                        theme::badge(ui, &p, version);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text(t("Seed vergessen"))
+                            .clicked()
+                        {
+                            *action = Some(Action::RemoveSeed(index));
+                        }
+                    });
+                });
+                ui.label(theme::secondary(&p, format!("Seed {seed_text}")).size(12.5));
+                let seed = minecraft::seed_from_text(seed_text);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(seed) = seed {
+                        if ui.button(t("Seed kopieren")).clicked() {
+                            *action = Some(Action::CopySeed(seed));
+                        }
+                    }
+                    map_buttons(ui, seed, version, action);
+                });
+                if index + 1 < shared.settings.minecraft_seeds.len() {
+                    ui.separator();
+                }
+            }
+        });
+    }
+
+    /// Unterseiten-Wahl; steht fest oben, außerhalb des Scrollbereichs.
+    pub fn header(&mut self, ui: &mut Ui, shared: &mut Shared) {
+        let p = shared.palette;
+        if !self.loaded {
+            self.loaded = true;
+            self.reload(shared);
+        }
+        ui.horizontal(|ui| {
+            for (sub, label) in [(Sub::Mca, "MCA"), (Sub::SeedMap, "Seed Map")] {
+                if theme::chip(ui, &p, label, self.sub == sub).clicked() {
+                    self.sub = sub;
+                }
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    pub fn ui(&mut self, ui: &mut Ui, shared: &mut Shared) {
+        let p = shared.palette;
+        if !self.loaded {
+            self.loaded = true;
+            self.reload(shared);
+        }
+        let mut action = None;
+
+        match self.sub {
+            Sub::Mca => {
+                self.mca_card(ui, &p, &mut action);
+                ui.add_space(4.0);
+                self.worlds_section(ui, shared, &mut action);
+            }
+            Sub::SeedMap => {
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(400.0);
+                        self.seeds_card(ui, shared, &mut action);
+                        ui.add_space(4.0);
+                        self.worlds_section(ui, shared, &mut action);
+                    });
+                    ui.vertical(|ui| {
+                        theme::card(&p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            theme::card_title(ui, t("Seed-Karte in Toolless"));
+                            ui.label(
+                                theme::secondary(
+                                    &p,
+                                    t("Die Karte direkt in Toolless folgt später. Bis dahin öffnen die Schaltflächen links die Seed-Karte im Browser."),
+                                )
+                                .size(12.5),
+                            );
+                        });
+                    });
+                });
+            }
         }
 
         if let Some(action) = action {

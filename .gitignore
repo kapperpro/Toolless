@@ -1,3 +1,17 @@
+# Build
 /target
-*.log
+# Editor / System
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db
+*.log
+# Persönliche Daten gehören nie ins Repository
+*.dat
+*.tlbackup
+toolless-sicherung*
+# Überbleibsel der früheren Tauri-Version
+/toolles/
+/src-tauri/
+/node_modules/
+/dist/

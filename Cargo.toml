@@ -1,6 +1,6 @@
 [package]
 name = "toolless"
-version = "0.8.0"
+version = "0.9.2"
 description = "Toolless – kleine, effiziente Werkzeugsammlung für den Desktop (reines Rust, egui)"
 edition = "2021"
 

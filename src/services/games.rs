@@ -47,6 +47,28 @@ const HELPER_PARTS: &[&str] = &[
     "installer",
 ];
 
+/// Hilfsprogramme, die nie als Spiel gelten (außer der Nutzer fügt sie selbst hinzu):
+/// Übertaktungs-, Overlay- und Überwachungswerkzeuge.
+const UTILITY_PARTS: &[&str] = &[
+    "msiafterburner",
+    "afterburner",
+    "rtss",
+    "encoderserver",
+    "hwinfo",
+    "cpuz",
+    "gpuz",
+    "hwmonitor",
+    "nvcontainer",
+    "nvidia share",
+    "radeonsoftware",
+    "amdrsserv",
+    "obs64",
+    "obs32",
+    "streamlabs",
+    "steamwebhelper",
+    "toolless",
+];
+
 /// Spiele, die außerhalb der üblichen Bibliotheken liegen: Programmdatei → Name.
 const KNOWN_GAMES: &[(&str, &str)] = &[
     ("minecraft.windows.exe", "Minecraft (Bedrock)"),
@@ -75,6 +97,33 @@ pub struct GameConfig {
     pub custom: Vec<(String, String)>,
     /// Namen, die nicht als Spiel gezählt werden sollen.
     pub ignored: Vec<String>,
+    /// So viele Tage bleiben Sitzungen gespeichert (1–365; 0 = Standard).
+    pub retention_days: u32,
+    /// Höchstgröße der Datei in KB (0 = Standard).
+    pub max_kb: u32,
+}
+
+pub const DEFAULT_RETENTION_DAYS: u32 = 30;
+pub const DEFAULT_MAX_KB: u32 = 1024;
+
+impl GameConfig {
+    pub fn retention_secs(&self) -> u64 {
+        let days = if self.retention_days == 0 {
+            DEFAULT_RETENTION_DAYS
+        } else {
+            self.retention_days.clamp(1, 365)
+        };
+        days as u64 * 86_400
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        let kb = if self.max_kb == 0 {
+            DEFAULT_MAX_KB
+        } else {
+            self.max_kb
+        };
+        kb as usize * 1024
+    }
 }
 
 fn file_name(path: &str) -> &str {
@@ -109,6 +158,9 @@ pub fn detect(
         }
     }
     if !has_window {
+        return None;
+    }
+    if UTILITY_PARTS.iter().any(|part| lower_name.contains(part)) {
         return None;
     }
 
@@ -229,6 +281,46 @@ impl Library {
         }
     }
 
+    /// Löscht Sitzungen, die älter als `retention_secs` sind, und danach die ältesten,
+    /// bis `size_of` höchstens `max_bytes` meldet. Die Gesamtzeit wird aus den
+    /// verbleibenden Sitzungen neu berechnet; Spiele ohne Sitzung verschwinden.
+    pub fn prune(
+        &mut self,
+        now: u64,
+        retention_secs: u64,
+        max_bytes: usize,
+        size_of: impl Fn(&Library) -> usize,
+    ) {
+        let cutoff = now.saturating_sub(retention_secs);
+        let mut changed = false;
+        for game in &mut self.games {
+            let before = game.sessions.len();
+            game.sessions
+                .retain(|session| session.start + session.secs >= cutoff);
+            changed |= game.sessions.len() != before;
+        }
+        // Zu große Datei: die jeweils ältesten Sitzungen entfernen.
+        let mut guard = 0;
+        while size_of(self) > max_bytes && guard < 10_000 {
+            guard += 1;
+            let oldest = self
+                .games
+                .iter()
+                .enumerate()
+                .filter_map(|(index, game)| Some((index, game.sessions.first()?.start)))
+                .min_by_key(|(_, start)| *start);
+            let Some((index, _)) = oldest else { break };
+            self.games[index].sessions.remove(0);
+            changed = true;
+        }
+        if changed {
+            for game in &mut self.games {
+                game.total_secs = game.sessions.iter().map(|session| session.secs).sum();
+            }
+            self.games.retain(|game| !game.sessions.is_empty());
+        }
+    }
+
     pub fn remove(&mut self, name: &str) {
         self.games.retain(|game| game.name != name);
     }
@@ -346,6 +438,28 @@ mod tests {
 
         config.ignored.push("minecraft".to_owned());
         assert_eq!(detect("javaw.exe", Some(java), true, &config), None);
+    }
+
+    #[test]
+    fn prunes_old_sessions_and_large_files() {
+        let mut library = Library::default();
+        library.record("A", "", 10_000_000, 100);
+        library.record("A", "", 10_500_000, 100);
+        library.record("B", "", 10_000_000 + 100, 50);
+        // Aufbewahrung 100 000 s: nur Sitzungen ab Sekunde 10 400 000 bleiben (Ende zählt).
+        library.prune(10_500_100, 100_000, usize::MAX, |_| 0);
+        assert_eq!(library.games.len(), 1);
+        assert_eq!(library.games[0].total_secs, 100);
+        // Größenlimit: wirft die älteste Sitzung zuerst hinaus.
+        let mut library = Library::default();
+        library.record("A", "", 1000, 10);
+        library.record("A", "", 5000, 10);
+        library.record("A", "", 9000, 10);
+        library.prune(9100, u64::MAX / 2, 2, |lib| {
+            lib.games.iter().map(|game| game.sessions.len()).sum()
+        });
+        assert_eq!(library.games[0].sessions.len(), 2);
+        assert_eq!(library.games[0].total_secs, 20);
     }
 
     #[test]

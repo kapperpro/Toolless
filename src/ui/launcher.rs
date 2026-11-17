@@ -47,6 +47,8 @@ enum Action {
     ToggleFavorite(String),
     /// Selbst hinzugefügten Eintrag wieder entfernen.
     RemoveCustom(String),
+    /// Nachfragen, bevor ein eigener Eintrag entfernt wird.
+    AskRemoveCustom(String),
 }
 
 /// Ordnername, unter dem selbst hinzugefügte Einträge erscheinen.
@@ -60,6 +62,8 @@ enum ScanMessage {
 
 #[derive(Default)]
 pub struct LauncherView {
+    /// Wartet auf Bestätigung: eigenen Eintrag (Pfad) entfernen.
+    confirm_remove: Option<String>,
     /// Kopien aus den Einstellungen: eigene Einträge (Name, Pfad) und Favoriten.
     custom: Vec<(String, String)>,
     favorites: BTreeSet<String>,
@@ -80,6 +84,13 @@ pub struct LauncherView {
 }
 
 impl LauncherView {
+    /// Sucht die Programme neu, sofern nicht schon ein Scan läuft.
+    pub fn refresh(&mut self, ctx: &egui::Context) {
+        if self.scan.is_none() {
+            self.start_scan(ctx);
+        }
+    }
+
     /// Sucht die Programme im Hintergrund. Die Liste selbst kommt nach wenigen
     /// Millisekunden, die Icons werden danach Stück für Stück nachgereicht.
     pub fn start_scan(&mut self, ctx: &egui::Context) {
@@ -229,7 +240,11 @@ impl LauncherView {
                 }
                 shared.save_settings();
             }
+            Action::AskRemoveCustom(path) => {
+                self.confirm_remove = Some(path);
+            }
             Action::RemoveCustom(path) => {
+                self.confirm_remove = None;
                 shared
                     .settings
                     .launcher_custom
@@ -309,7 +324,7 @@ impl LauncherView {
                     if self.custom.iter().any(|(_, path)| path == &app.path)
                         && ui.button(t("Eigenen Eintrag entfernen")).clicked()
                     {
-                        *action = Some(Action::RemoveCustom(app.path.clone()));
+                        *action = Some(Action::AskRemoveCustom(app.path.clone()));
                         ui.close_menu();
                     }
                     ui.separator();
@@ -356,6 +371,38 @@ impl LauncherView {
             .iter()
             .filter(|app| self.hidden.contains(&app.path))
             .count();
+
+        // Sicherheitsabfrage vor dem Entfernen eigener Einträge.
+        let mut confirmed: Option<Action> = None;
+        if let Some(path) = self.confirm_remove.clone() {
+            let name = self
+                .custom
+                .iter()
+                .find(|(_, custom)| custom == &path)
+                .map_or_else(|| path.clone(), |(name, _)| name.clone());
+            theme::card(&p).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(crate::i18n::td(format!(
+                        "Eintrag „{name}“ wirklich entfernen?"
+                    )));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(t("Abbrechen")).clicked() {
+                            self.confirm_remove = None;
+                        }
+                        if ui
+                            .button(RichText::new(t("Entfernen")).color(p.danger))
+                            .clicked()
+                        {
+                            confirmed = Some(Action::RemoveCustom(path.clone()));
+                        }
+                    });
+                });
+            });
+        }
+        if let Some(action) = confirmed {
+            self.apply(action, shared);
+        }
 
         // ── Zeile 1: Suche + Start ──
         ui.horizontal(|ui| {

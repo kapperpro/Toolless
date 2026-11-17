@@ -21,6 +21,8 @@ enum Action {
     RemoveCustom(usize),
     Ignore(String),
     Unignore(usize),
+    AskCustom(usize),
+    AskIgnored(usize),
     AskRemove(String),
     Remove(String),
     Export,
@@ -31,6 +33,11 @@ pub struct GamesView {
     search: String,
     /// Wartet auf Bestätigung: Zeiten dieses Spiels löschen.
     confirm_remove: Option<String>,
+    /// Angeklickter Tag im Balkendiagramm (Beginn des Tages, Sekunden seit 1970).
+    selected_day: Option<u64>,
+    /// Wartet auf Bestätigung: eigenes Programm bzw. Ausschluss (Index) entfernen.
+    confirm_custom: Option<usize>,
+    confirm_ignored: Option<usize>,
 }
 
 /// „3 h 05 min“, „12 min“ oder „40 s“.
@@ -89,6 +96,7 @@ impl GamesView {
                 if index < shared.settings.games_custom.len() {
                     shared.settings.games_custom.remove(index);
                 }
+                self.confirm_custom = None;
             }
             Action::Ignore(name) => {
                 if !shared.settings.games_ignored.contains(&name) {
@@ -99,6 +107,15 @@ impl GamesView {
                 if index < shared.settings.games_ignored.len() {
                     shared.settings.games_ignored.remove(index);
                 }
+                self.confirm_ignored = None;
+            }
+            Action::AskCustom(index) => {
+                self.confirm_custom = Some(index);
+                config_changed = false;
+            }
+            Action::AskIgnored(index) => {
+                self.confirm_ignored = Some(index);
+                config_changed = false;
             }
             Action::AskRemove(name) => {
                 self.confirm_remove = Some(name);
@@ -138,19 +155,24 @@ impl GamesView {
 
     pub fn ui(&mut self, ui: &mut Ui, shared: &mut Shared) {
         let p = shared.palette;
-        let (library, running, apps): (Library, Vec<String>, Vec<(String, String)>) =
-            shared.monitor.read(|state| {
-                (
-                    state.games.clone(),
-                    state.running_games.clone(),
-                    state
-                        .processes
-                        .iter()
-                        .filter(|row| row.is_app)
-                        .filter_map(|row| Some((row.name.clone(), row.exe.clone()?)))
-                        .collect(),
-                )
-            });
+        let (library, running, apps, games_bytes): (
+            Library,
+            Vec<String>,
+            Vec<(String, String)>,
+            usize,
+        ) = shared.monitor.read(|state| {
+            (
+                state.games.clone(),
+                state.running_games.clone(),
+                state
+                    .processes
+                    .iter()
+                    .filter(|row| row.is_app)
+                    .filter_map(|row| Some((row.name.clone(), row.exe.clone()?)))
+                    .collect(),
+                state.games_bytes,
+            )
+        });
         let mut action: Option<Action> = None;
 
         let now = games_now();
@@ -218,11 +240,33 @@ impl GamesView {
                 .collect();
             let peak = days.iter().map(|(_, secs)| *secs).max().unwrap_or(0).max(1);
             ui.add_space(6.0);
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(ui.available_width(), 96.0), Sense::hover());
+            let (rect, bars) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 96.0), Sense::click());
             let slot = rect.width() / 7.0;
+            if bars.clicked() {
+                if let Some(pos) = bars.interact_pointer_pos() {
+                    let index = ((pos.x - rect.left()) / slot).floor().clamp(0.0, 6.0) as usize;
+                    let start = days[index].0;
+                    self.selected_day = if self.selected_day == Some(start) {
+                        None
+                    } else {
+                        Some(start)
+                    };
+                }
+            }
+            if bars.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
             for (index, (start, secs)) in days.iter().enumerate() {
                 let x = rect.left() + slot * (index as f32 + 0.5);
+                if self.selected_day == Some(*start) {
+                    let column = egui::Rect::from_min_max(
+                        egui::pos2(x - slot * 0.5 + 2.0, rect.top()),
+                        egui::pos2(x + slot * 0.5 - 2.0, rect.bottom()),
+                    );
+                    ui.painter()
+                        .rect_filled(column, 4.0, p.accent.gamma_multiply(0.14));
+                }
                 let bar_height = (rect.height() - 34.0) * (*secs as f32 / peak as f32);
                 let bar = egui::Rect::from_min_max(
                     egui::pos2(x - slot * 0.28, rect.bottom() - 16.0 - bar_height.max(1.0)),
@@ -249,6 +293,67 @@ impl GamesView {
                 }
             }
         });
+
+        // ── Sitzungen des angeklickten Tages ──
+        if let Some(day_start) = self.selected_day {
+            let day_end = day_start + DAY;
+            let mut entries: Vec<(&str, u64, u64)> = Vec::new();
+            for game in &library.games {
+                for session in &game.sessions {
+                    let end = session.start + session.secs;
+                    if end > day_start && session.start < day_end {
+                        entries.push((
+                            game.name.as_str(),
+                            session.start.max(day_start),
+                            end.min(day_end),
+                        ));
+                    }
+                }
+            }
+            entries.sort_by_key(|entry| entry.1);
+            let (_, month, day, _, _) = platform::local_parts(day_start + DAY / 2);
+            theme::card(&p).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{day:02}.{month:02}.")).strong());
+                    let total: u64 = entries.iter().map(|entry| entry.2 - entry.1).sum();
+                    ui.label(theme::secondary(&p, format_duration(total)).size(12.5));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text(t("Schließen")).clicked() {
+                            self.selected_day = None;
+                        }
+                    });
+                });
+                if entries.is_empty() {
+                    ui.label(theme::secondary(
+                        &p,
+                        t("An diesem Tag wurde nicht gespielt."),
+                    ));
+                } else {
+                    egui::Grid::new("games-day")
+                        .num_columns(4)
+                        .striped(true)
+                        .spacing(egui::vec2(26.0, 6.0))
+                        .show(ui, |ui| {
+                            for title in ["Spiel", "Von", "Bis", "Dauer"] {
+                                ui.label(theme::secondary(&p, t(title)).size(12.5));
+                            }
+                            ui.end_row();
+                            for (name, start, end) in &entries {
+                                let clock = |time: u64| {
+                                    let (_, _, _, hour, minute) = platform::local_parts(time);
+                                    format!("{hour:02}:{minute:02}")
+                                };
+                                ui.label(RichText::new(*name).strong());
+                                ui.label(clock(*start));
+                                ui.label(clock(*end));
+                                ui.label(format_duration(end - start));
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+        }
 
         // ── Werkzeugleiste ──
         ui.horizontal(|ui| {
@@ -310,6 +415,53 @@ impl GamesView {
                     });
                 });
             });
+        }
+
+        // Sicherheitsabfragen für eigene Programme und Ausschlüsse.
+        if let Some(index) = self.confirm_custom {
+            if let Some((name, _)) = shared.settings.games_custom.get(index) {
+                let name = name.clone();
+                theme::card(&p).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(td(format!("Eigenes Programm „{name}“ wirklich entfernen?")));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(t("Abbrechen")).clicked() {
+                                self.confirm_custom = None;
+                            }
+                            if ui
+                                .button(RichText::new(t("Entfernen")).color(p.danger))
+                                .clicked()
+                            {
+                                action = Some(Action::RemoveCustom(index));
+                            }
+                        });
+                    });
+                });
+            } else {
+                self.confirm_custom = None;
+            }
+        }
+        if let Some(index) = self.confirm_ignored {
+            if let Some(name) = shared.settings.games_ignored.get(index) {
+                let name = name.clone();
+                theme::card(&p).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(td(format!("„{name}“ wieder als Spiel zählen?")));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(t("Abbrechen")).clicked() {
+                                self.confirm_ignored = None;
+                            }
+                            if ui.button(t("Ja, wieder zählen")).clicked() {
+                                action = Some(Action::Unignore(index));
+                            }
+                        });
+                    });
+                });
+            } else {
+                self.confirm_ignored = None;
+            }
         }
 
         // ── Spiele ──
@@ -397,11 +549,11 @@ impl GamesView {
                         for (index, (name, path)) in shared.settings.games_custom.iter().enumerate()
                         {
                             if ui
-                                .small_button(format!("{name}  ✕"))
+                                .small_button(format!("{name}  ×"))
                                 .on_hover_text(path)
                                 .clicked()
                             {
-                                action = Some(Action::RemoveCustom(index));
+                                action = Some(Action::AskCustom(index));
                             }
                         }
                     });
@@ -411,16 +563,68 @@ impl GamesView {
                         ui.label(theme::secondary(&p, t("Ausgeschlossen:")).size(12.5));
                         for (index, name) in shared.settings.games_ignored.iter().enumerate() {
                             if ui
-                                .small_button(format!("{name}  ✕"))
+                                .small_button(format!("{name}  ×"))
                                 .on_hover_text(t("Wieder als Spiel zählen"))
                                 .clicked()
                             {
-                                action = Some(Action::Unignore(index));
+                                action = Some(Action::AskIgnored(index));
                             }
                         }
                     });
                 }
             });
+        }
+
+        // ── Speicher: Aufbewahrung und Dateigröße ──
+        let mut storage_changed = false;
+        theme::card(&p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(theme::secondary(&p, t("Aufbewahren:")).size(12.5));
+                let days = &mut shared.settings.games_retention_days;
+                let drag = egui::DragValue::new(days)
+                    .range(1..=365)
+                    .speed(0.5)
+                    .custom_formatter(|value, _| {
+                        if value <= 1.0 {
+                            t("24 Stunden").to_owned()
+                        } else {
+                            td(format!("{} Tage", value as u32))
+                        }
+                    })
+                    .custom_parser(|text| {
+                        let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
+                        digits.parse::<f64>().ok()
+                    });
+                let response = ui.add(drag);
+                storage_changed |= response.drag_stopped() || response.lost_focus();
+                ui.add_space(12.0);
+                ui.label(theme::secondary(&p, t("Höchstgröße der Datei:")).size(12.5));
+                let max_kb = &mut shared.settings.games_max_kb;
+                let response = ui.add(egui::DragValue::new(max_kb).range(16..=51_200).speed(8.0).suffix(" KB"));
+                storage_changed |= response.drag_stopped() || response.lost_focus();
+                ui.add_space(12.0);
+                ui.label(
+                    theme::secondary(
+                        &p,
+                        td(format!("Aktuell: {:.1} KB", games_bytes as f64 / 1024.0)),
+                    )
+                    .size(12.5),
+                );
+            });
+            ui.label(
+                theme::secondary(
+                    &p,
+                    t("Ältere Sitzungen werden automatisch gelöscht; ist die Datei zu groß, zuerst die ältesten."),
+                )
+                .size(12.0),
+            );
+        });
+        if storage_changed {
+            shared.save_settings();
+            shared
+                .monitor
+                .send(Command::Games(shared.settings.game_config()));
         }
 
         if let Some(action) = action {

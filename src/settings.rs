@@ -17,17 +17,42 @@ pub enum Appearance {
     System,
     Light,
     Dark,
+    /// Reines Schwarz – spart bei OLED-Bildschirmen Strom.
+    Oled,
+    HighContrastDark,
+    HighContrastLight,
+    /// Eigene Farben für Hintergrund, Seitenleiste und Karten.
+    Custom,
 }
 
 impl Appearance {
-    pub const ALL: [Appearance; 3] = [Appearance::System, Appearance::Light, Appearance::Dark];
+    pub const ALL: [Appearance; 7] = [
+        Appearance::System,
+        Appearance::Light,
+        Appearance::Dark,
+        Appearance::Oled,
+        Appearance::HighContrastDark,
+        Appearance::HighContrastLight,
+        Appearance::Custom,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Appearance::System => "Automatisch",
             Appearance::Light => "Hell",
             Appearance::Dark => "Dunkel",
+            Appearance::Oled => "OLED (reines Schwarz)",
+            Appearance::HighContrastDark => "Hoher Kontrast – dunkel",
+            Appearance::HighContrastLight => "Hoher Kontrast – hell",
+            Appearance::Custom => "Benutzerdefiniert",
         }
+    }
+
+    pub fn is_high_contrast(self) -> bool {
+        matches!(
+            self,
+            Appearance::HighContrastDark | Appearance::HighContrastLight
+        )
     }
 }
 
@@ -117,6 +142,14 @@ impl Language {
     }
 }
 
+/// Gespeicherter Countdown (Vorlage; laufende Countdowns werden nicht gespeichert).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedCountdown {
+    pub id: u64,
+    pub label: String,
+    pub secs: u32,
+}
+
 /// Gespeicherter Wecker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedAlarm {
@@ -151,8 +184,21 @@ pub struct Settings {
     pub tab_order: Vec<String>,
     /// Ausgeblendete Werkzeuge (Schlüssel).
     pub hidden_tabs: Vec<String>,
-    /// Spotify-Ansicht: Lautstärkeregler anzeigen.
-    pub show_volume: bool,
+    /// Spotify-Ansicht: Akzentfarbe aus dem Cover des laufenden Titels.
+    pub spotify_cover_accent: bool,
+    /// Das Willkommensfenster wurde schon gezeigt.
+    pub onboarded: bool,
+    /// Messabstand des Task-Managers in Millisekunden.
+    pub monitor_interval_ms: u64,
+    /// So viele Tage bleibt der Verlauf des Task-Managers gespeichert.
+    pub history_days: u32,
+    /// Spaltenbreiten der Prozessliste (CPU, Arbeitsspeicher, Datenträger); leer = Standard.
+    pub process_columns: Vec<f32>,
+    /// Spaltenbreiten der Autostart-Liste (Name, Status, Herkunft); leer = Standard.
+    pub startup_columns: Vec<f32>,
+    /// Seitenleiste nur mit Symbolen.
+    pub sidebar_collapsed: bool,
+
     /// Schließen versteckt das Fenster im Tray, statt die App zu beenden.
     pub close_to_tray: bool,
     /// Im App-Starter auch Systemwerkzeuge, Hilfedateien u. Ä. anzeigen.
@@ -172,16 +218,28 @@ pub struct Settings {
     /// Game Timer: eigene Programme (Name, Programmdatei) und ausgeschlossene Namen.
     pub games_custom: Vec<(String, String)>,
     pub games_ignored: Vec<String>,
-    /// Uhr: Wecker, zuletzt eingestellter Countdown (Sekunden) und ob jede Taste den
-    /// schwarzen Bildschirm beendet.
+    /// Game Timer: Aufbewahrung in Tagen (1–365) und Höchstgröße der Datei in KB.
+    pub games_retention_days: u32,
+    pub games_max_kb: u32,
+    /// Uhr: Wecker und Countdowns.
     pub alarms: Vec<SavedAlarm>,
-    pub countdown_secs: u32,
+    pub countdowns: Vec<SavedCountdown>,
+    /// Vollbildmodi (AFK, große Uhr, Spotify): beenden mit F11, Esc, eigener Taste oder
+    /// jeder Taste. Esc 20 Sekunden lang gehalten beendet immer.
+    pub afk_exit_f11: bool,
+    pub afk_exit_esc: bool,
+    /// Name einer eigenen Beenden-Taste (egui-Tastenname), leer = keine.
+    pub afk_custom_key: String,
     pub blackout_any_key: bool,
+    /// Bildschirme (Nummern ab 0) für die Vollbildmodi; leer = alle.
+    pub afk_screens: Vec<usize>,
 
     /// Minecraft: Pfad zu MCA Selector (leer = automatisch suchen).
     pub mca_selector_path: String,
     /// Minecraft: zusätzliche Ordner (Instanz, `.minecraft` oder `saves`) mit Welten.
     pub minecraft_folders: Vec<String>,
+    /// Gemerkte Seeds: Name, Seed (Zahl oder Text) und Version.
+    pub minecraft_seeds: Vec<(String, String, String)>,
 }
 
 impl Default for Settings {
@@ -201,7 +259,15 @@ impl Default for Settings {
             last_tab: String::new(),
             tab_order: Vec::new(),
             hidden_tabs: Vec::new(),
-            show_volume: true,
+            spotify_cover_accent: false,
+            sidebar_collapsed: false,
+            onboarded: false,
+            monitor_interval_ms: 1000,
+            history_days: 7,
+
+            process_columns: Vec::new(),
+            startup_columns: Vec::new(),
+
             close_to_tray: true,
             show_system_apps: false,
             power_cpu_max_w: 65.0,
@@ -215,11 +281,19 @@ impl Default for Settings {
             launcher_custom: Vec::new(),
             games_custom: Vec::new(),
             games_ignored: Vec::new(),
+            games_retention_days: 30,
+            games_max_kb: 1024,
             alarms: Vec::new(),
-            countdown_secs: 300,
+            countdowns: Vec::new(),
+            afk_exit_f11: true,
+            afk_exit_esc: true,
+            afk_custom_key: String::new(),
             blackout_any_key: false,
+            afk_screens: Vec::new(),
+
             mca_selector_path: String::new(),
             minecraft_folders: Vec::new(),
+            minecraft_seeds: Vec::new(),
         }
     }
 }
@@ -230,6 +304,8 @@ impl Settings {
         crate::services::games::GameConfig {
             custom: self.games_custom.clone(),
             ignored: self.games_ignored.clone(),
+            retention_days: self.games_retention_days,
+            max_kb: self.games_max_kb,
         }
     }
 

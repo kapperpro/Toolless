@@ -6,7 +6,7 @@
 //! Der Minutenverlauf der letzten Tage wird verschlüsselt gespeichert.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -26,18 +26,21 @@ use crate::{
     services::{
         games::{self, GameConfig, Library},
         gpu::GpuProbe,
+        hwinfo::{self, SystemStats},
         pdh, perf_parse,
         winsys::{self, PhysicalDisk},
     },
 };
 
 /// Messabstand, solange der Monitor sichtbar ist bzw. im Hintergrund.
-const ACTIVE_INTERVAL: Duration = Duration::from_secs(2);
-const BACKGROUND_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
+const BACKGROUND_INTERVAL: Duration = Duration::from_secs(5);
 /// Feiner Verlauf: eine Stunde im aktiven Messabstand.
-const RECENT_CAPACITY: usize = 1800;
-/// Grober Verlauf: sieben Tage in Minutenwerten.
-const MINUTES_CAPACITY: usize = 7 * 24 * 60;
+const RECENT_CAPACITY: usize = 12_000;
+/// Mittlerer Verlauf: zwei Tage in 30-Sekunden-Werten.
+const THIRTY_CAPACITY: usize = 2 * 24 * 120;
+/// Grober Verlauf: höchstens 30 Tage in Minutenwerten (die gewählte Dauer steht in den Einstellungen).
+const MINUTES_MAX: usize = 30 * 24 * 60;
 const SAVE_EVERY: Duration = Duration::from_secs(300);
 const DISK_REFRESH_EVERY: Duration = Duration::from_secs(15);
 /// Geschätzte Leistungsaufnahme des Arbeitsspeichers je Gigabyte.
@@ -50,6 +53,11 @@ const GPU_MEMORY_COUNTER: &str = r"\GPU Adapter Memory(*)\Dedicated Usage";
 const DISK_READ_COUNTER: &str = r"\PhysicalDisk(*)\Disk Read Bytes/sec";
 const DISK_WRITE_COUNTER: &str = r"\PhysicalDisk(*)\Disk Write Bytes/sec";
 const DISK_IDLE_COUNTER: &str = r"\PhysicalDisk(*)\% Idle Time";
+/// Mittlere Antwortzeit je Datenträger (Sekunden je Übertragung).
+const DISK_LATENCY_COUNTER: &str = r"\PhysicalDisk(*)\Avg. Disk sec/Transfer";
+const GPU_SHARED_COUNTER: &str = r"\GPU Adapter Memory(*)\Shared Usage";
+/// So lange (in Sekunden) bleibt die Auslastung der einzelnen Kerne im Speicher.
+const CORE_HISTORY_SECONDS: f64 = 70.0;
 /// Energiezähler von Windows (Milliwatt je Messstelle) – nur auf Systemen vorhanden,
 /// deren Prozessor und Treiber sie bereitstellen.
 const ENERGY_COUNTER: &str = r"\Energy Meter(*)\Power";
@@ -65,6 +73,9 @@ pub struct Sample {
     /// Sekunden seit 1970.
     #[serde(rename = "t")]
     pub time: u64,
+    /// Sekundenbruchteil des Zeitpunkts (für Messabstände unter einer Sekunde).
+    #[serde(rename = "tf", default, skip_serializing_if = "is_zero")]
+    pub frac: f32,
     /// Auslastungen in Prozent.
     #[serde(rename = "c")]
     pub cpu: f32,
@@ -108,6 +119,17 @@ pub struct Sample {
     pub disks: Vec<[f32; 3]>,
 }
 
+fn is_zero(value: &f32) -> bool {
+    *value == 0.0
+}
+
+impl Sample {
+    /// Zeitpunkt in Sekunden seit 1970 samt Bruchteil.
+    pub fn secs(&self) -> f64 {
+        self.time as f64 + self.frac as f64
+    }
+}
+
 /// Aktueller Stand einer Grafikkarte.
 #[derive(Debug, Clone, Default)]
 pub struct GpuInfo {
@@ -116,6 +138,8 @@ pub struct GpuInfo {
     pub temperature: Option<f32>,
     /// Belegter dedizierter Grafikspeicher in Bytes.
     pub memory_used: Option<u64>,
+    /// Belegter gemeinsamer Speicher (Arbeitsspeicher, den die Karte nutzt) in Bytes.
+    pub shared_used: Option<u64>,
 }
 
 /// Durchsatz einer Netzwerkschnittstelle in Bytes/s.
@@ -167,6 +191,7 @@ pub struct PowerConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct PowerBreakdown {
     pub cpu_w: f32,
     /// `true`, wenn Windows die Prozessorleistung misst (Energiezähler).
@@ -187,6 +212,7 @@ pub struct PowerBreakdown {
 pub struct State {
     pub recent: VecDeque<Sample>,
     pub minutes: VecDeque<Sample>,
+    pub thirty: VecDeque<Sample>,
     pub processes: Vec<ProcessRow>,
     pub disks: Vec<DiskRow>,
     pub physical_disks: Vec<PhysicalDisk>,
@@ -198,6 +224,12 @@ pub struct State {
     pub cores: Vec<f32>,
     pub cpu_mhz: u64,
     pub uptime: u64,
+    /// Zähler des Systems (zugesichert, zwischengespeichert, Handles, Threads …).
+    pub system: SystemStats,
+    /// Auslastung je Kern über die letzten Sekunden: (Zeitpunkt, Prozent je Kern).
+    pub core_history: VecDeque<(f64, Vec<f32>)>,
+    /// Mittlere Antwortzeit je Datenträgernummer in Millisekunden.
+    pub disk_latency: Vec<f32>,
     pub process_count: usize,
     pub swap_total: u64,
     pub swap_used: u64,
@@ -208,6 +240,8 @@ pub struct State {
     /// Game Timer: alle erfassten Spiele und die Namen der gerade laufenden.
     pub games: Library,
     pub running_games: Vec<String>,
+    /// Größe der Spielzeiten-Datei in Bytes (unverschlüsselt gerechnet).
+    pub games_bytes: usize,
     pub total_ram: u64,
     pub used_ram: u64,
     /// Meldung des Workers (z. B. nach „Task beenden“); die GUI holt sie einmalig ab.
@@ -223,6 +257,10 @@ pub enum Command {
     Games(GameConfig),
     /// Game Timer: ein Spiel samt seiner Zeiten löschen.
     RemoveGame(String),
+    /// Messabstand in Millisekunden, solange der Task-Manager sichtbar ist.
+    Interval(u64),
+    /// So viele Tage bleibt der Verlauf gespeichert (1 bis 30).
+    Retention(u32),
 }
 
 /// Gespeicherter Verlauf.
@@ -230,6 +268,7 @@ pub enum Command {
 #[serde(default)]
 struct HistoryFile {
     minutes: VecDeque<Sample>,
+    thirty: VecDeque<Sample>,
     total_wh: f64,
 }
 
@@ -319,10 +358,21 @@ struct Worker {
     gpu_counter: Option<pdh::Counter>,
     gpu_counter_age: u32,
     gpu_memory_counter: Option<pdh::Counter>,
+    gpu_shared_counter: Option<pdh::Counter>,
+    /// So viele Minutenwerte bleiben im Verlauf.
+    minutes_capacity: usize,
+    latency_counter: Option<pdh::Counter>,
+    /// Größe des komprimierten Speichers (aus dem Prozess „Memory Compression“).
+    compressed: u64,
     disk_counters: Option<[pdh::Counter; 3]>,
     energy_counter: Option<pdh::Counter>,
     /// Messpunkte der laufenden Minute (für den Minutenverlauf).
     minute_bucket: Vec<Sample>,
+    thirty_bucket: Vec<Sample>,
+    /// Messabstand bei sichtbarem Task-Manager.
+    interval: Duration,
+    /// Letzte vollständige Messung inklusive Prozessliste.
+    last_full: Instant,
     last_sample: Instant,
     last_save: Instant,
     last_disks: Option<Instant>,
@@ -358,9 +408,19 @@ impl Worker {
             gpu_counter: pdh::Counter::open(GPU_COUNTER),
             gpu_counter_age: 0,
             gpu_memory_counter: pdh::Counter::open(GPU_MEMORY_COUNTER),
+            gpu_shared_counter: pdh::Counter::open(GPU_SHARED_COUNTER),
+            minutes_capacity: MINUTES_MAX,
+            latency_counter: pdh::Counter::open(DISK_LATENCY_COUNTER),
+            compressed: 0,
+
             disk_counters: open_disk_counters(),
             energy_counter: pdh::Counter::open(ENERGY_COUNTER),
             minute_bucket: Vec::new(),
+            thirty_bucket: Vec::new(),
+            interval: DEFAULT_INTERVAL,
+            last_full: Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now),
             last_sample: Instant::now(),
             last_save: Instant::now(),
             last_disks: None,
@@ -389,7 +449,7 @@ impl Worker {
 
         loop {
             let interval = if self.active.load(Ordering::Relaxed) {
-                ACTIVE_INTERVAL
+                self.interval
             } else {
                 BACKGROUND_INTERVAL
             };
@@ -402,8 +462,22 @@ impl Worker {
                     self.config = config;
                     continue;
                 }
+                Ok(Command::Retention(days)) => {
+                    self.minutes_capacity = days.clamp(1, 30) as usize * 24 * 60;
+                    let mut state = lock(&self.state);
+                    while state.minutes.len() > self.minutes_capacity {
+                        state.minutes.pop_front();
+                    }
+                    continue;
+                }
+                Ok(Command::Interval(millis)) => {
+                    self.interval = Duration::from_millis(millis.clamp(100, 5000));
+                    continue;
+                }
                 Ok(Command::Games(config)) => {
                     self.game_config = config;
+                    self.save_games();
+                    self.repaint.request_repaint();
                     continue;
                 }
                 Ok(Command::RemoveGame(name)) => {
@@ -518,6 +592,27 @@ impl Worker {
         (activity, letters)
     }
 
+    /// Mittlere Antwortzeit je Datenträger in Millisekunden.
+    fn disk_latency(&mut self) -> Vec<f32> {
+        let mut latency: Vec<f32> = Vec::new();
+        let Some(counter) = self.latency_counter.as_mut() else {
+            return latency;
+        };
+        for (name, seconds) in counter.read() {
+            let Some((number, _)) = perf_parse::disk_instance(&name) else {
+                continue;
+            };
+            if number >= MAX_DISKS {
+                continue;
+            }
+            if latency.len() <= number {
+                latency.resize(number + 1, 0.0);
+            }
+            latency[number] = (seconds * 1000.0).max(0.0) as f32;
+        }
+        latency
+    }
+
     /// Gemessene Leistung von Prozessor und Arbeitsspeicher in Watt, falls Windows
     /// Energiezähler dafür anbietet.
     fn measured_power(&mut self) -> (Option<f32>, Option<f32>) {
@@ -546,7 +641,17 @@ impl Worker {
         self.last_sample = Instant::now();
         let seconds = elapsed.as_secs_f32().max(0.1);
 
-        self.system.refresh_all();
+        // Bei sehr kurzen Messabständen werden nur Auslastung und Speicher neu gelesen; die
+        // teure Prozessliste folgt höchstens einmal pro Sekunde.
+        let light = self.last_full.elapsed() < Duration::from_millis(900);
+        let full_seconds = self.last_full.elapsed().as_secs_f32().max(0.1);
+        if light {
+            self.system.refresh_cpu_usage();
+            self.system.refresh_memory();
+        } else {
+            self.system.refresh_all();
+            self.last_full = Instant::now();
+        }
         let cores = self.system.cpus().len().max(1) as f32;
         let cpu = self.system.global_cpu_usage().clamp(0.0, 100.0);
         let total_ram = self.system.total_memory();
@@ -575,10 +680,27 @@ impl Worker {
         }
         networks.sort_by(|a, b| (b.down + b.up).total_cmp(&(a.down + a.up)));
 
-        // Prozesse gleichen Namens zusammenfassen.
-        let window_pids = winsys::window_process_ids();
+        // Prozesse gleichen Namens zusammenfassen (bei leichten Messungen: letzter Stand).
+        let (previous_processes, previous_games) = {
+            let state = lock(&self.state);
+            if light {
+                (state.processes.clone(), state.running_games.clone())
+            } else {
+                (Vec::new(), Vec::new())
+            }
+        };
+        let window_pids = if light {
+            HashSet::new()
+        } else {
+            winsys::window_process_ids()
+        };
         let mut groups: HashMap<String, ProcessRow> = HashMap::new();
-        for (pid, process) in self.system.processes() {
+        let live_processes = if light {
+            None
+        } else {
+            Some(self.system.processes())
+        };
+        for (pid, process) in live_processes.into_iter().flatten() {
             let name = process.name().to_string_lossy().into_owned();
             if pid.as_u32() == 0 || name.is_empty() {
                 continue; // Leerlaufprozess
@@ -603,16 +725,23 @@ impl Worker {
             row.pids.push(pid.as_u32());
             row.cpu += process.cpu_usage() / cores;
             row.memory += process.memory();
-            row.disk_read += usage.read_bytes as f32 / seconds;
-            row.disk_write += usage.written_bytes as f32 / seconds;
+            row.disk_read += usage.read_bytes as f32 / full_seconds;
+            row.disk_write += usage.written_bytes as f32 / full_seconds;
             row.is_app |= window_pids.contains(&pid.as_u32());
         }
-        let mut processes: Vec<ProcessRow> = groups.into_values().collect();
+        let mut processes: Vec<ProcessRow> = if light {
+            previous_processes
+        } else {
+            groups.into_values().collect()
+        };
         processes.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
         // Game Timer: Spielzeit der laufenden Spiele verbuchen (Pausen wie der
         // Ruhezustand zählen nicht mit).
-        let mut running_games: Vec<(String, String)> = Vec::new();
-        for row in &processes {
+        let mut running_games: Vec<(String, String)> = previous_games
+            .into_iter()
+            .map(|name| (name, String::new()))
+            .collect();
+        for row in processes.iter().filter(|_| !light) {
             let found = games::detect(&row.name, row.exe.as_deref(), row.is_app, &self.game_config);
             if let Some(name) = found {
                 if !running_games.iter().any(|(known, _)| known == &name) {
@@ -623,7 +752,7 @@ impl Worker {
         self.game_carry += elapsed.min(Duration::from_secs(30)).as_secs_f64();
         let played = self.game_carry.floor();
         self.game_carry -= played;
-        if played >= 1.0 {
+        if played >= 1.0 && !light {
             for (name, exe) in &running_games {
                 self.games.record(name, exe, unix_now(), played as u64);
             }
@@ -650,6 +779,11 @@ impl Worker {
             .as_mut()
             .map(|counter| perf_parse::sum_by_adapter(&counter.read()))
             .unwrap_or_default();
+        let shared_by_adapter = self
+            .gpu_shared_counter
+            .as_mut()
+            .map(|counter| perf_parse::sum_by_adapter(&counter.read()))
+            .unwrap_or_default();
         let gpu = self.gpu.sample();
         let gpus: Vec<GpuInfo> = gpu
             .adapters
@@ -673,6 +807,12 @@ impl Worker {
                     .luids
                     .iter()
                     .filter_map(|luid| memory_by_adapter.get(luid))
+                    .map(|bytes| *bytes as u64)
+                    .max(),
+                shared_used: adapter
+                    .luids
+                    .iter()
+                    .filter_map(|luid| shared_by_adapter.get(luid))
                     .map(|bytes| *bytes as u64)
                     .max(),
             })
@@ -737,8 +877,12 @@ impl Worker {
             row.power_w = cpu_part + ram_part;
         }
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let sample = Sample {
-            time: unix_now(),
+            time: now.as_secs(),
+            frac: now.subsec_millis() as f32 / 1000.0,
             cpu,
             ram,
             gpu: gpu_usage,
@@ -770,24 +914,53 @@ impl Worker {
             .map(|cpu| cpu.cpu_usage())
             .collect();
         let cpu_mhz = self.system.cpus().first().map_or(0, |cpu| cpu.frequency());
+        if !light {
+            self.compressed = processes
+                .iter()
+                .find(|row| row.name == "Memory Compression")
+                .map_or(0, |row| row.memory);
+        }
+        let mut stats = hwinfo::system_stats().unwrap_or_default();
+        stats.compressed = self.compressed;
+        let disk_latency = self.disk_latency();
+        let core_time = sample.secs();
         let process_count = self.system.processes().len();
         let (swap_total, swap_used) = (self.system.total_swap(), self.system.used_swap());
-        let finished_minute = self.push_minute(&sample);
+        let finished_minute = push_period(&mut self.minute_bucket, &sample, 60);
+        let finished_thirty = push_period(&mut self.thirty_bucket, &sample, 30);
 
         let mut state = lock(&self.state);
         state.recent.push_back(sample);
         while state.recent.len() > RECENT_CAPACITY {
             state.recent.pop_front();
         }
+        if let Some(entry) = finished_thirty {
+            state.thirty.push_back(entry);
+            while state.thirty.len() > THIRTY_CAPACITY {
+                state.thirty.pop_front();
+            }
+        }
         if let Some(minute) = finished_minute {
             state.minutes.push_back(minute);
-            while state.minutes.len() > MINUTES_CAPACITY {
+            while state.minutes.len() > self.minutes_capacity {
                 state.minutes.pop_front();
             }
         }
         state.processes = processes;
         state.total_ram = total_ram;
         state.used_ram = used_ram;
+        state.core_history.push_back((core_time, cores.clone()));
+        while state
+            .core_history
+            .front()
+            .is_some_and(|(time, _)| core_time - *time > CORE_HISTORY_SECONDS)
+        {
+            state.core_history.pop_front();
+        }
+        state.system = stats;
+        if !disk_latency.is_empty() {
+            state.disk_latency = disk_latency;
+        }
         state.cores = cores;
         state.cpu_mhz = cpu_mhz;
         state.uptime = System::uptime();
@@ -812,20 +985,6 @@ impl Worker {
             session_wh: self.session_wh,
             total_wh: self.total_wh,
         };
-    }
-
-    /// Sammelt Messpunkte je Minute; liefert den Mittelwert, sobald eine Minute voll ist.
-    fn push_minute(&mut self, sample: &Sample) -> Option<Sample> {
-        let minute = sample.time / 60;
-        let finished = match self.minute_bucket.first() {
-            Some(first) if first.time / 60 != minute => Some(average(&self.minute_bucket)),
-            _ => None,
-        };
-        if finished.is_some() {
-            self.minute_bucket.clear();
-        }
-        self.minute_bucket.push(sample.clone());
-        finished
     }
 
     /// Volumes, physische Datenträger und Autostart-Einträge – ändern sich selten.
@@ -864,16 +1023,20 @@ impl Worker {
         let history = serde_json::from_slice::<HistoryFile>(&bytes).or_else(|_| {
             serde_json::from_slice::<VecDeque<Sample>>(&bytes).map(|minutes| HistoryFile {
                 minutes,
+                thirty: VecDeque::new(),
                 total_wh: 0.0,
             })
         });
         if let Ok(mut history) = history {
             // Nur behalten, was noch in den Zeitraum fällt.
-            let oldest = unix_now().saturating_sub(MINUTES_CAPACITY as u64 * 60);
+            let oldest = unix_now().saturating_sub(MINUTES_MAX as u64 * 60);
             history.minutes.retain(|sample| sample.time >= oldest);
+            let oldest_thirty = unix_now().saturating_sub(THIRTY_CAPACITY as u64 * 30);
+            history.thirty.retain(|sample| sample.time >= oldest_thirty);
             self.total_wh = history.total_wh;
             let mut state = lock(&self.state);
             state.minutes = history.minutes;
+            state.thirty = history.thirty;
             state.power.total_wh = self.total_wh;
         }
     }
@@ -888,13 +1051,25 @@ impl Worker {
         };
         if let Ok(library) = serde_json::from_slice::<Library>(&bytes) {
             self.games = library;
-            lock(&self.state).games = self.games.clone();
+            let mut state = lock(&self.state);
+            state.games = self.games.clone();
+            state.games_bytes = bytes.len();
         }
     }
 
-    fn save_games(&self) {
+    fn save_games(&mut self) {
+        let size_of = |library: &Library| serde_json::to_vec(library).map_or(0, |json| json.len());
+        self.games.prune(
+            unix_now(),
+            self.game_config.retention_secs(),
+            self.game_config.max_bytes(),
+            size_of,
+        );
         if let Ok(json) = serde_json::to_vec(&self.games) {
             let _ = crypto::write_file(&self.games_path(), &json);
+            let mut state = lock(&self.state);
+            state.games = self.games.clone();
+            state.games_bytes = json.len();
         }
     }
 
@@ -905,6 +1080,7 @@ impl Worker {
             let state = lock(&self.state);
             serde_json::to_vec(&HistoryFile {
                 minutes: state.minutes.clone(),
+                thirty: state.thirty.clone(),
                 total_wh: self.total_wh,
             })
         };
@@ -913,6 +1089,21 @@ impl Worker {
             let _ = crypto::write_file(&self.history_path, &json);
         }
     }
+}
+
+/// Sammelt Messpunkte je Zeitraum (`period` Sekunden); liefert den Mittelwert, sobald ein
+/// Zeitraum voll ist.
+fn push_period(bucket: &mut Vec<Sample>, sample: &Sample, period: u64) -> Option<Sample> {
+    let slot = sample.time / period;
+    let finished = match bucket.first() {
+        Some(first) if first.time / period != slot => Some(average(bucket)),
+        _ => None,
+    };
+    if finished.is_some() {
+        bucket.clear();
+    }
+    bucket.push(sample.clone());
+    finished
 }
 
 /// Mittelwert mehrerer Messpunkte; als „Top-Programm“ gilt das mit der höchsten Last.
@@ -932,6 +1123,7 @@ fn average(samples: &[Sample]) -> Sample {
         .max_by(|a, b| a.top_cpu.total_cmp(&b.top_cpu));
     Sample {
         time: samples.first().map_or(0, |sample| sample.time),
+        frac: samples.first().map_or(0.0, |sample| sample.frac),
         cpu: mean(|s| s.cpu),
         ram: mean(|s| s.ram),
         gpu: mean_some(|s| s.gpu),

@@ -189,10 +189,14 @@ impl CalculatorView {
         } else {
             (fill, color)
         };
-        let button = Button::new(RichText::new(label).size(17.0).color(color))
-            .fill(fill)
-            .stroke(Stroke::new(1.0_f32, p.separator.gamma_multiply(0.6)))
-            .rounding(p.radius);
+        let button = Button::new(
+            RichText::new(label)
+                .size((self.key_h * 0.32).clamp(16.0, 22.0))
+                .color(color),
+        )
+        .fill(fill)
+        .stroke(Stroke::new(1.0_f32, p.separator.gamma_multiply(0.6)))
+        .rounding(p.radius);
         if ui.add_sized([width, self.key_h], button).clicked() {
             self.press(command);
         }
@@ -325,7 +329,7 @@ impl CalculatorView {
         let available = ui.available_size();
         let side_by_side = available.x >= 620.0;
         let pad_width = if side_by_side {
-            (available.x - HISTORY_WIDTH - 2.0 * CARD_PADDING - 8.0).clamp(250.0, 520.0)
+            (available.x - HISTORY_WIDTH - 2.0 * CARD_PADDING - 8.0).clamp(250.0, 780.0)
         } else {
             (available.x - CARD_PADDING).clamp(220.0, 520.0)
         };
@@ -335,7 +339,7 @@ impl CalculatorView {
         } else {
             320.0
         };
-        self.key_h = (height_for_keys / 6.0 - GAP).clamp(34.0, 62.0);
+        self.key_h = (height_for_keys / 6.0 - GAP).clamp(34.0, 72.0);
         self.history_w = if side_by_side {
             HISTORY_WIDTH
         } else {

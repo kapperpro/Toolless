@@ -64,6 +64,11 @@ const COPIED_SECONDS: f64 = 1.6;
 const NO_CATEGORY: &str = "Ohne Kategorie";
 
 impl ClipboardView {
+    /// Liest die Zwischenablage beim nächsten Bild neu.
+    pub fn refresh(&mut self) {
+        self.last_read = 0.0;
+    }
+
     fn refresh_system(&mut self, ui: &Ui, shared: &Shared) {
         if shared.now - self.last_read >= REFRESH_SECONDS || self.last_read == 0.0 {
             self.last_read = shared.now;
