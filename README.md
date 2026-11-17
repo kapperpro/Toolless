@@ -24,25 +24,6 @@ Current version: **0.9.2** – see the [CHANGELOG](CHANGELOG.md). License: [GNU 
 ## Install
 
 Ready-made installers are available under [Releases](https://github.com/kapperpro/toolless/releases).
-You can also build the installer yourself (see "Build the installer" below).
-
-## Run
-
-The only requirement is [Rust](https://rustup.rs) (on Windows including the MSVC Build Tools).
-
-```bash
-cargo run            # development
-cargo build --release
-cargo test           # tests for calculator, PDF export, note blocks, NBT, Minecraft, performance counters
-```
-
-## Build the installer
-
-1. Run `cargo build --release` – this creates `target\release\toolless.exe`.
-2. Open `executable\toolless.iss` in [Inno Setup 6](https://jrsoftware.org/isinfo.php) and compile it (Ctrl+F9).
-3. The installer is then located at `executable\output\Toolless-Setup-<version>.exe`.
-
-The installer recommends administrator rights (installs to `Program Files`) but can also install for the current user only.
 
 ## Spotify
 
